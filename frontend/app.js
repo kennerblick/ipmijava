@@ -272,8 +272,7 @@ async function openConsole(serverId) {
     jnlpBtn.href = data.jnlp_proxy;
     jnlpBtn.removeAttribute('target');  // download in same context
 
-    document.getElementById('console-html5-btn').href = data.html5_url;
-    document.getElementById('console-bmc-btn').href   = data.bmc_url;
+    document.getElementById('console-bmc-btn').href = data.bmc_url;
 
     new bootstrap.Modal(document.getElementById('consoleModal')).show();
   } catch (e) {

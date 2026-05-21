@@ -335,43 +335,39 @@ def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session
 
 
 def _bmc_navigate_to_kvm(sess: req_lib.Session, base: str) -> None:
-    """Visit mainmenu and topmenu, then set the navigation cookies that ATEN uses
-    to gate the JNLP endpoint. Extract cookie names/values from topmenu JS."""
+    """Simulate the browser navigation path to the iKVM console page.
+
+    From topmenu JS analysis:
+      page_mapping('remote', 'man_ikvm')  →  sets cookies + loads man_ikvm frame
+
+    This sets the ATEN navigation cookies and visits the man_ikvm content page,
+    which likely initialises the iKVM service on the BMC side before the JNLP
+    URL becomes accessible.
+    """
+    topmenu_ref = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
+    man_ikvm_url = f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"
+
     try:
         sess.get(f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", timeout=5)
     except Exception:
         pass
-
-    topmenu_text = ''
     try:
-        r = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=topmenu", timeout=10)
-        topmenu_text = r.text
+        sess.get(topmenu_ref, timeout=8)
     except Exception:
         pass
 
-    if not topmenu_text:
-        return
+    # Set the navigation cookies that page_mapping('remote', 'man_ikvm') would set
+    sess.cookies.set('mainpage', 'remote')
+    sess.cookies.set('subpage',  'man_ikvm')
 
-    # Find SetCookie calls near KVM/IKVM/remote keywords (±400 chars context)
-    for m in re.finditer(r'(?:ikvm|kvm|remote|iview|console)', topmenu_text, re.I):
-        start = max(0, m.start() - 400)
-        end   = min(len(topmenu_text), m.end() + 400)
-        chunk = topmenu_text[start:end]
-        for name, val in re.findall(
-            r'SetCookie\s*\(\s*["\'](\w+)["\'],\s*["\']([^"\']+)["\']', chunk
-        ):
-            sess.cookies.set(name, val)
-
-    # Fallback: try common ATEN navigation cookie patterns for the KVM section
-    # These values appear in ATEN firmware source for the remote control menu
-    for pattern in [
-        r'c_mainpage\s*=\s*["\']([^"\']+)["\'].*?(?:ikvm|kvm|remote)',
-        r'(?:ikvm|kvm|remote).*?c_mainpage\s*=\s*["\']([^"\']+)["\']',
-    ]:
-        m = re.search(pattern, topmenu_text, re.I | re.S)
-        if m:
-            sess.cookies.set('mainpage', m.group(1))
-            break
+    # Visit the Console Redirection content page.
+    # This page calls GetIKVMStatus() via AJAX which starts the iKVM service —
+    # only after this does url_redirect.cgi?url_name=ikvm become accessible.
+    try:
+        sess.get(man_ikvm_url, timeout=10,
+                 headers={'Referer': topmenu_ref})
+    except Exception:
+        pass
 
 
 def _pick_sid(cookies) -> str | None:
@@ -398,8 +394,9 @@ def _extract_sid_from_body(text: str) -> str | None:
 
 def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Response | None:
     """Try all known JNLP paths, then scrape navigation pages for firmware-specific URLs."""
-    # Referer mimics the browser being on the topmenu/navigation page
-    jnlp_headers = {'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu"}
+    # Referer mimics the browser being on the Console Redirection page (man_ikvm),
+    # which is the last page visited by _bmc_navigate_to_kvm before the JNLP fetch.
+    jnlp_headers = {'Referer': f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"}
 
     candidates = []
     for path in _JNLP_PATHS:
@@ -601,8 +598,9 @@ def api_jnlp_debug(server_id):
     for label, url_name, body_limit in [
         ('3_mainmenu',       'mainmenu',       800),
         ('4_topmenu',        'topmenu',        8000),   # need full JS to find KVM cookie values
-        ('5_remote_control', 'remote_control', 2000),
-        ('6_remote_ctrl',    'remote_ctrl',    2000),
+        ('5_man_ikvm',       'man_ikvm',       4000),   # Console Redirection page — calls GetIKVMStatus()
+        ('6_remote_control', 'remote_control', 2000),
+        ('7_remote_ctrl',    'remote_ctrl',    2000),
     ]:
         try:
             pg = sess.get(f"{base}/cgi/url_redirect.cgi?url_name={url_name}", timeout=10)
@@ -649,7 +647,7 @@ def api_jnlp_debug(server_id):
     except Exception as e:
         steps.append({'step': '6b_topmenu_kvm_cookies', 'error': str(e)})
 
-    # Step 7: fetch JS utility file — often contains the iKVM launch URL
+    # Step 8: fetch JS utility file — often contains the iKVM launch URL
     for js_path in ['/js/utils.js', '/js/util.js', '/js/ikvm.js', '/js/kvm.js']:
         try:
             r = sess.get(f"{base}{js_path}", timeout=8)
@@ -657,7 +655,7 @@ def api_jnlp_debug(server_id):
                 # Extract any .jnlp or cgi references from the JS
                 jnlp_refs = re.findall(r'["\']([^"\']*(?:jnlp|ikvm|launch|kvm)[^"\']*)["\']', r.text, re.I)
                 steps.append({
-                    'step': f'7_js_{js_path.split("/")[-1]}',
+                    'step': f'8_js_{js_path.split("/")[-1]}',
                     'url': js_path,
                     'status': r.status_code,
                     'body_length': len(r.content),
