@@ -1,0 +1,58 @@
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+body { background-color: #0d1117; }
+
+/* ── Sidebar ────────────────────────────────────────────────────────────── */
+.sidebar { background-color: #161b22; }
+
+.sidebar-group { border-radius: 6px; margin-bottom: 2px; }
+.sidebar-group.active .sidebar-row { background: rgba(31, 111, 235, 0.18); color: #79b8ff; }
+
+.sidebar-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: #8b949e;
+  font-size: 0.875rem;
+  user-select: none;
+  transition: background 0.1s, color 0.1s;
+}
+.sidebar-row:hover { background: rgba(255,255,255,0.06); color: #e6edf3; }
+
+.sb-btn {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: inherit;
+  opacity: 0;
+  transition: opacity 0.15s;
+  cursor: pointer;
+  font-size: 0.8rem;
+  line-height: 1;
+}
+.sidebar-row:hover .sb-btn { opacity: 0.7; }
+.sidebar-row:hover .sb-btn:hover { opacity: 1; }
+
+/* ── Server Cards ───────────────────────────────────────────────────────── */
+.server-card {
+  background-color: #161b22;
+  border: 1px solid #30363d;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.server-card:hover {
+  border-color: #58a6ff;
+  box-shadow: 0 0 0 1px #1f6feb33;
+}
+
+/* ── Misc ──────────────────────────────────────────────────────────────── */
+code { color: #79c0ff; background: rgba(121,192,255,.12); padding: 0 4px; border-radius: 3px; }
+
+.ls-wide { letter-spacing: .08em; font-size: .7rem; }
+
+/* scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #30363d; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #484f58; }

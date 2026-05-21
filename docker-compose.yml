@@ -1,0 +1,11 @@
+services:
+  ipmijava:
+    build: .
+    image: ipmijava:latest
+    container_name: ipmijava
+    # host network gives direct access to IPMI interfaces and enables nmap scanning
+    # on Linux hosts — remove network_mode and add ports: ["9193:9193"] if not on Linux
+    network_mode: host
+    volumes:
+      - ./config:/config
+    restart: unless-stopped

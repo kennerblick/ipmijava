@@ -1,0 +1,17 @@
+# Config with credentials — mount from host, never commit
+config/servers.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Docker build artifacts
+*.tar
+
+# Editor
+.vscode/
+.idea/
+*.swp

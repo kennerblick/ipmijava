@@ -1,0 +1,40 @@
+{
+  "groups": [
+    {
+      "id": "group-prod",
+      "name": "Produktion",
+      "servers": [
+        {
+          "id": "srv-001",
+          "name": "SRV-PROD-01",
+          "ip": "192.168.1.100",
+          "username": "ADMIN",
+          "password": "ADMIN",
+          "description": "Supermicro X11 - 2U"
+        },
+        {
+          "id": "srv-002",
+          "name": "SRV-PROD-02",
+          "ip": "192.168.1.101",
+          "username": "ADMIN",
+          "password": "ADMIN",
+          "description": ""
+        }
+      ]
+    },
+    {
+      "id": "group-dev",
+      "name": "Entwicklung",
+      "servers": [
+        {
+          "id": "srv-dev-01",
+          "name": "SRV-DEV-01",
+          "ip": "192.168.2.50",
+          "username": "ADMIN",
+          "password": "ADMIN",
+          "description": "Dev / Test"
+        }
+      ]
+    }
+  ]
+}

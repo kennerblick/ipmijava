@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="de" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IPMI Manager</title>
+  <link rel="stylesheet" href="/lib/bootstrap.min.css">
+  <link rel="stylesheet" href="/lib/bootstrap-icons.min.css">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+  <!-- Navbar -->
+  <nav class="navbar bg-dark border-bottom border-secondary px-3" style="height:52px;">
+    <span class="navbar-brand mb-0 fw-bold">
+      <i class="bi bi-cpu-fill text-primary me-2"></i>IPMI Manager
+    </span>
+    <div class="d-flex gap-2 ms-auto">
+      <button class="btn btn-sm btn-outline-secondary" onclick="refreshAll()" title="Alle Status aktualisieren">
+        <i class="bi bi-arrow-clockwise"></i> Refresh
+      </button>
+      <button class="btn btn-sm btn-outline-warning" onclick="showScanModal()">
+        <i class="bi bi-radar"></i> Scan
+      </button>
+      <button class="btn btn-sm btn-primary" onclick="showAddGroupModal()">
+        <i class="bi bi-plus-lg"></i> Gruppe
+      </button>
+    </div>
+  </nav>
+
+  <div class="d-flex" style="height:calc(100vh - 52px); overflow:hidden;">
+
+    <!-- Sidebar -->
+    <div class="sidebar d-flex flex-column border-end border-secondary" style="width:240px;min-width:240px;">
+      <div class="p-2 border-bottom border-secondary">
+        <small class="text-muted text-uppercase fw-semibold ls-wide">Server-Gruppen</small>
+      </div>
+      <div id="sidebar" class="flex-grow-1 overflow-auto p-2"></div>
+    </div>
+
+    <!-- Main -->
+    <div class="flex-grow-1 overflow-auto p-4">
+      <div id="server-grid"></div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div id="toast-container" class="toast-container position-fixed bottom-0 end-0 p-3" style="z-index:9999;"></div>
+
+  <!-- ── Group Modal ─────────────────────────────────────────── -->
+  <div class="modal fade" id="groupModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="group-modal-title">Neue Gruppe</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="group-id-input">
+          <div class="mb-3">
+            <label class="form-label">Gruppenname</label>
+            <input type="text" class="form-control" id="group-name-input"
+                   placeholder="z.B. Produktion"
+                   onkeypress="if(event.key==='Enter') saveGroup()">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
+          <button type="button" class="btn btn-primary" onclick="saveGroup()">Speichern</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Server Modal ────────────────────────────────────────── -->
+  <div class="modal fade" id="serverModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="server-modal-title">Neuer Server</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <input type="hidden" id="server-id-input">
+          <input type="hidden" id="server-group-id">
+          <div class="mb-3">
+            <label class="form-label">Name <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="server-name-input" placeholder="z.B. SRV-PROD-01">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">IPMI IP-Adresse <span class="text-danger">*</span></label>
+            <input type="text" class="form-control" id="server-ip-input" placeholder="192.168.1.100">
+          </div>
+          <div class="row">
+            <div class="col mb-3">
+              <label class="form-label">Benutzername</label>
+              <input type="text" class="form-control" id="server-user-input" value="ADMIN">
+            </div>
+            <div class="col mb-3">
+              <label class="form-label">Passwort</label>
+              <div class="input-group">
+                <input type="password" class="form-control" id="server-pass-input" placeholder="ADMIN">
+                <button class="btn btn-outline-secondary" type="button"
+                        onclick="togglePassword('server-pass-input', this)">
+                  <i class="bi bi-eye"></i>
+                </button>
+              </div>
+            </div>
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Beschreibung</label>
+            <input type="text" class="form-control" id="server-desc-input" placeholder="Optional">
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
+          <button type="button" class="btn btn-primary" onclick="saveServer()">Speichern</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Scan Modal ──────────────────────────────────────────── -->
+  <div class="modal fade" id="scanModal" tabindex="-1">
+    <div class="modal-dialog modal-lg">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-radar me-2 text-warning"></i>Netzwerk-Scan</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small mb-3">
+            Scannt nach IPMI/BMC-Geräten (TCP 623, 443, 80). Erfordert nmap im Container (bevorzugt) oder direkten Socket-Scan.
+          </p>
+          <div class="input-group mb-3">
+            <span class="input-group-text"><i class="bi bi-diagram-3"></i></span>
+            <input type="text" class="form-control" id="scan-network-input"
+                   placeholder="z.B. 192.168.1.0/24 oder 10.0.0.0/22"
+                   onkeypress="if(event.key==='Enter') startScan()">
+            <button class="btn btn-warning" id="scan-btn" onclick="startScan()">
+              <i class="bi bi-radar"></i> Scannen
+            </button>
+          </div>
+          <div id="scan-results"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Schließen</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Console Modal ───────────────────────────────────────── -->
+  <div class="modal fade" id="consoleModal" tabindex="-1">
+    <div class="modal-dialog">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-display me-2 text-info"></i>KVM Konsole</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small">Wähle die Verbindungsmethode für <strong id="console-server-name"></strong>:</p>
+          <div class="d-grid gap-2">
+            <a id="console-ikvm-btn" href="#" target="_blank" class="btn btn-primary" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
+              <i class="bi bi-display me-2"></i>Java iKVM (JNLP) öffnen
+            </a>
+            <a id="console-html5-btn" href="#" target="_blank" class="btn btn-outline-info" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
+              <i class="bi bi-browser-chrome me-2"></i>HTML5 KVM öffnen (neuere BMCs)
+            </a>
+            <a id="console-bmc-btn" href="#" target="_blank" class="btn btn-outline-secondary" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
+              <i class="bi bi-gear me-2"></i>BMC Web-Interface öffnen
+            </a>
+          </div>
+          <div class="alert alert-info mt-3 mb-0 small">
+            <i class="bi bi-info-circle me-1"></i>
+            Für Java iKVM muss Java auf dem Client-Rechner installiert und JNLP-Dateien als Java-Web-Start konfiguriert sein.
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/lib/bootstrap.bundle.min.js"></script>
+  <script src="/app.js"></script>
+</body>
+</html>
