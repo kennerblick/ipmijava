@@ -523,92 +523,128 @@ def api_console_jnlp(server_id):
   <style>
     body {{ font-family:sans-serif; background:#0d1117; color:#e6edf3;
             display:flex; flex-direction:column; align-items:center;
-            justify-content:center; min-height:100vh; margin:0; padding:1rem; }}
-    h2  {{ margin-bottom:.5rem; }}
-    p   {{ color:#8b949e; margin:.4rem 0; font-size:.95rem; }}
+            justify-content:center; min-height:100vh; margin:0; padding:1rem;
+            text-align:center; }}
+    h2 {{ margin-bottom:.5rem; }}
+    p  {{ color:#8b949e; margin:.4rem 0; font-size:.95rem; }}
     .btn {{ display:inline-block; padding:.55rem 1.4rem; background:#1f6feb;
              color:#fff; border:none; border-radius:6px; cursor:pointer;
-             font-size:1rem; text-decoration:none; margin:.5rem .2rem; }}
+             font-size:1rem; text-decoration:none; margin:.4rem .2rem; }}
     .btn:hover {{ background:#388bfd; }}
-    .btn-sec {{ background:#30363d; }}
+    .btn-sec {{ background:#30363d; color:#e6edf3; }}
     .btn-sec:hover {{ background:#484f58; }}
-    #step2 {{ display:none; text-align:center; }}
-    #step-error {{ display:none; color:#f85149; text-align:center; }}
-    .spinner {{ display:inline-block; width:1.2rem; height:1.2rem;
+    .spinner {{ display:inline-block; width:1rem; height:1rem;
                 border:3px solid #30363d; border-top-color:#58a6ff;
                 border-radius:50%; animation:spin .8s linear infinite;
-                vertical-align:middle; margin-right:.5rem; }}
+                vertical-align:middle; margin-right:.4rem; }}
     @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+    #step-error {{ display:none; color:#f85149; }}
+    #step-retry {{ display:none; }}
   </style>
 </head>
 <body>
-  <!-- Hidden login frame — sets SID cookie in user's browser for the BMC domain -->
-  <iframe id="lf" name="lf" style="display:none" width="1" height="1"></iframe>
-  <form id="lf-form" action="{login_url}" method="post" target="lf">
+  <!--
+    Login form — submitted into a tiny popup window.
+    A popup (not an iframe) establishes its own first-party browsing context
+    for the BMC domain, so the SID cookie goes into the unpartitioned global
+    store.  When this relay tab then navigates to man_ikvm the cookie is
+    present and the "session timed out" error does not occur.
+  -->
+  <form id="lf" action="{login_url}" method="post">
     <input type="hidden" name="name" value="{username}">
     <input type="hidden" name="pwd"  value="{password}">
   </form>
 
-  <div id="step1" style="text-align:center">
-    <h2>iKVM Konsole — {ip}</h2>
-    <p><span class="spinner"></span>Anmeldung am BMC läuft…</p>
-    <p style="font-size:.8rem;margin-top:.8rem">Bitte warten</p>
+  <div id="step-working">
+    <h2>iKVM — {ip}</h2>
+    <p><span class="spinner"></span><span id="status-msg">Anmeldung am BMC…</span></p>
   </div>
 
-  <div id="step2">
-    <h2>iKVM Konsole — {ip}</h2>
-    <p>Anmeldung erfolgreich. Die BMC-Konsole öffnet sich in einem neuen Tab.</p>
-    <p style="margin-top:.8rem">
-      <a id="console-link" href="{console_url}" target="_blank" class="btn">
-        🖥&nbsp;Konsole öffnen (neuer Tab)
-      </a>
-      <a href="{bmc_base}" target="_blank" class="btn btn-sec">BMC Web-UI</a>
-    </p>
-    <p style="font-size:.82rem;margin-top:.6rem;color:#8b949e">
-      Im neuen Tab auf <strong>Launch iKVM</strong> / <strong>Launch Console</strong> klicken.<br>
-      Die JNLP-Datei wird dann automatisch heruntergeladen.
-    </p>
+  <div id="step-retry">
+    <h2>iKVM — {ip}</h2>
+    <p>Popup-Fenster wurde vom Browser blockiert.</p>
+    <button class="btn" onclick="startLogin()">🔑 Anmelden &amp; Konsole öffnen</button>
+    <br>
+    <a href="{bmc_base}" target="_blank" class="btn btn-sec" style="margin-top:.6rem">BMC direkt öffnen</a>
   </div>
 
   <div id="step-error">
-    <h2 style="color:#f85149">Anmeldung fehlgeschlagen</h2>
-    <p>Zugangsdaten oder BMC-Verbindung prüfen.</p>
-    <a href="{bmc_base}" target="_blank" class="btn">BMC direkt öffnen</a>
+    <h2>Fehler</h2>
+    <p id="error-msg">Anmeldung fehlgeschlagen oder Timeout.</p>
+    <button class="btn" onclick="startLogin()">Erneut versuchen</button>
+    <a href="{bmc_base}" target="_blank" class="btn btn-sec">BMC direkt öffnen</a>
   </div>
 
   <script>
-  (function() {{
-    var done = false;
-    var frame = document.getElementById('lf');
+  var CONSOLE_URL = '{console_url}';
+  var pollTimer   = null;
+  var timeoutId   = null;
+  var loginPopup  = null;
 
-    function onLoginDone() {{
-      if (done) return;
-      done = true;
-      document.getElementById('step1').style.display = 'none';
-      document.getElementById('step2').style.display = 'block';
-      // Auto-open the console tab
-      var w = window.open('{console_url}', '_blank', 'noopener,noreferrer');
-      if (!w) {{
-        // Popup blocked — manual button is already shown
-      }}
+  function startLogin() {{
+    document.getElementById('step-retry').style.display  = 'none';
+    document.getElementById('step-error').style.display  = 'none';
+    document.getElementById('step-working').style.display = 'block';
+    document.getElementById('status-msg').textContent = 'Anmeldung am BMC…';
+
+    // Open a tiny off-screen popup — it is its own top-level browsing context,
+    // so cookies the BMC sets inside it land in the global (unpartitioned)
+    // first-party store for the BMC domain.
+    loginPopup = window.open(
+      'about:blank', 'bmc_login_popup',
+      'width=1,height=1,left=-200,top=-200,menubar=no,toolbar=no,status=no,scrollbars=no'
+    );
+
+    if (!loginPopup) {{
+      // Popup blocker active — show manual button
+      document.getElementById('step-working').style.display = 'none';
+      document.getElementById('step-retry').style.display   = 'block';
+      return;
     }}
 
-    frame.addEventListener('load', onLoginDone);
+    // Route form submission into the popup
+    var form = document.getElementById('lf');
+    form.setAttribute('target', 'bmc_login_popup');
+    form.submit();
 
-    // Timeout fallback (12 s)
-    setTimeout(function() {{
-      if (!done) {{
-        done = true;
-        document.getElementById('step1').style.display = 'none';
-        document.getElementById('step-error').style.display = 'block';
-      }}
-    }}, 12000);
+    // Poll until the popup crosses into BMC domain (becomes cross-origin)
+    pollTimer = setInterval(checkPopup, 150);
+    timeoutId = setTimeout(onTimeout, 15000);
+  }}
 
-    // Submit login after short render delay
-    setTimeout(function() {{
-      document.getElementById('lf-form').submit();
-    }}, 400);
-  }})();
+  function checkPopup() {{
+    if (!loginPopup || loginPopup.closed) {{
+      clearInterval(pollTimer); pollTimer = null;
+      return;
+    }}
+    try {{
+      // As long as the popup is on about:blank or our own origin this succeeds
+      var _unused = loginPopup.location.href;
+    }} catch (e) {{
+      // SecurityError: popup navigated to the BMC domain —
+      // login response has been received, SID cookie is now set (first-party).
+      clearInterval(pollTimer); pollTimer = null;
+      clearTimeout(timeoutId);
+      // Brief pause so the browser fully commits the cookie, then navigate
+      setTimeout(function() {{
+        try {{ loginPopup.close(); }} catch (_) {{}}
+        window.location.href = CONSOLE_URL;
+      }}, 250);
+    }}
+  }}
+
+  function onTimeout() {{
+    clearInterval(pollTimer); pollTimer = null;
+    if (loginPopup && !loginPopup.closed) {{ try {{ loginPopup.close(); }} catch(_) {{}} }}
+    document.getElementById('step-working').style.display = 'none';
+    document.getElementById('step-error').style.display   = 'block';
+    document.getElementById('error-msg').textContent =
+      'Timeout — BMC nicht erreichbar oder falsche Zugangsdaten.';
+  }}
+
+  // Auto-start: this page was opened by a user click so window.open is
+  // typically allowed; if not the retry button is shown.
+  startLogin();
   </script>
 </body>
 </html>"""
