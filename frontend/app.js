@@ -184,7 +184,7 @@ function serverCardHtml(server, status, groupId) {
 
           <!-- Secondary actions -->
           <div class="d-flex gap-1">
-            <button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="KVM im Browser (Docker-Proxy)">
+            <button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="HTML5 KVM (Browser-Konsole)">
               <i class="bi bi-display"></i>
             </button>
             <button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Java iKVM / BMC-Optionen">
@@ -270,7 +270,13 @@ async function openConsole(serverId) {
 
     document.getElementById('console-server-name').textContent = srv?.name ?? serverId;
 
-    // Opens our relay page in a new tab — relay logs browser into BMC and opens man_ikvm
+    // HTML5 KVM button — opens embedded kvmModal
+    document.getElementById('console-html5-btn').onclick = () => {
+      bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide();
+      openKvm(serverId);
+    };
+
+    // Java iKVM relay — logs browser into BMC, navigates to man_ikvm (user clicks Launch)
     const jnlpBtn = document.getElementById('console-ikvm-btn');
     jnlpBtn.href   = data.jnlp_proxy;
     jnlpBtn.target = '_blank';
@@ -507,78 +513,25 @@ function showToast(msg, type = 'info') {
 }
 
 
-// ── KVM Browser ──────────────────────────────────────────────────────────────
+// ── KVM Browser (HTML5) ───────────────────────────────────────────────────────
 
-let _kvmServerId  = null;
-let _kvmPollTimer = null;
-let _kvmModal     = null;
+let _kvmServerId = null;
+let _kvmModal    = null;
 
-async function openKvm(serverId) {
-  const srv = state.groups.flatMap(g => g.servers).find(s => s.id === serverId);
+function openKvm(serverId) {
+  const srv    = state.groups.flatMap(g => g.servers).find(s => s.id === serverId);
+  const relayUrl = `${API}/servers/${serverId}/html5-kvm`;
   _kvmServerId = serverId;
 
   document.getElementById('kvm-server-name').textContent = srv?.name ?? serverId;
-  document.getElementById('kvm-loading').style.display   = 'block';
-  document.getElementById('kvm-frame').style.display     = 'none';
-  document.getElementById('kvm-frame').src               = 'about:blank';
-  _kvmSetBadge('secondary', 'Starte…');
-  document.getElementById('kvm-loading-msg').textContent = 'Starte KVM-Session…';
+  document.getElementById('kvm-newtab-btn').href = relayUrl;
+  _kvmSetBadge('secondary', 'Anmeldung…');
+
+  const frame = document.getElementById('kvm-frame');
+  frame.src = relayUrl;
 
   _kvmModal = new bootstrap.Modal(document.getElementById('kvmModal'));
   _kvmModal.show();
-
-  try {
-    const r = await apiPost(`/servers/${serverId}/kvm-session`, {});
-    if (r.status === 'running') {
-      _kvmShowFrame(r.ws_port);
-    } else if (r.status === 'error') {
-      _kvmError(r.error || 'Unbekannter Fehler');
-    } else {
-      _kvmPoll(serverId);
-    }
-  } catch (e) {
-    _kvmError(e.message);
-  }
-}
-
-function _kvmPoll(serverId) {
-  if (_kvmPollTimer) clearInterval(_kvmPollTimer);
-  _kvmPollTimer = setInterval(async () => {
-    try {
-      const r = await apiGet(`/servers/${serverId}/kvm-session`);
-      if (r.message) document.getElementById('kvm-loading-msg').textContent = r.message;
-      if (r.status === 'running') {
-        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
-        _kvmShowFrame(r.ws_port);
-      } else if (r.status === 'error') {
-        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
-        _kvmError(r.error || 'Fehler beim Starten');
-      }
-    } catch (e) {
-      // 404 = session was already removed (error occurred before we could poll)
-      if (e.message && e.message.includes('404')) {
-        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
-        _kvmError('Session nicht mehr vorhanden — JNLP-Fehler? Debug: /api/servers/' + serverId + '/jnlp-debug');
-      }
-      // other errors (network hiccup): keep polling
-    }
-  }, 1200);
-}
-
-function _kvmShowFrame(wsPort) {
-  const host = window.location.hostname;
-  const url  = `/novnc/vnc.html?host=${encodeURIComponent(host)}&port=${wsPort}&autoconnect=true&resize=scale&reconnect=true`;
-  document.getElementById('kvm-loading').style.display = 'none';
-  const frame = document.getElementById('kvm-frame');
-  frame.src   = url;
-  frame.style.display = 'block';
-  _kvmSetBadge('success', 'Verbunden');
-}
-
-function _kvmError(msg) {
-  document.getElementById('kvm-loading-msg').textContent = 'Fehler: ' + msg;
-  document.getElementById('kvm-loading').querySelector('div.spinner-border').style.display = 'none';
-  _kvmSetBadge('danger', 'Fehler');
 }
 
 function _kvmSetBadge(type, label) {
@@ -588,13 +541,16 @@ function _kvmSetBadge(type, label) {
 }
 
 function closeKvm() {
-  if (_kvmPollTimer) { clearInterval(_kvmPollTimer); _kvmPollTimer = null; }
   document.getElementById('kvm-frame').src = 'about:blank';
-  if (_kvmServerId) {
-    apiDelete(`/servers/${_kvmServerId}/kvm-session`).catch(() => {});
-    _kvmServerId = null;
-  }
+  _kvmServerId = null;
+  _kvmModal    = null;
 }
+
+// Listen for postMessage from html5-kvm relay page inside the iframe
+window.addEventListener('message', (e) => {
+  if (e.data?.type === 'kvm-ready')  _kvmSetBadge('info',    'HTML5 KVM');
+  if (e.data?.type === 'kvm-error')  _kvmSetBadge('danger',  'Fehler');
+});
 
 
 // ── Init ──────────────────────────────────────────────────────────────────────

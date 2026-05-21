@@ -688,6 +688,154 @@ def api_console_jnlp(server_id):
     return Response(page, content_type='text/html')
 
 
+@app.route('/api/servers/<server_id>/html5-kvm', methods=['GET'])
+def api_html5_kvm(server_id):
+    """Relay page: logs the browser into the BMC via a popup, then navigates to
+    the BMC's built-in HTML5 KVM viewer (man_ikvm_html5). No Java required.
+    Designed to run inside an iframe (kvmModal) or as a standalone tab.
+    Sends window.postMessage({type:'kvm-ready'}) to the parent before navigating,
+    so the parent modal can update its status badge.
+    """
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Nicht gefunden'}), 404
+
+    import html as html_mod
+    ip        = html_mod.escape(server['ip'])
+    username  = html_mod.escape(server['username'])
+    password  = html_mod.escape(server['password'])
+    bmc_base  = f"https://{server['ip']}"
+    login_url = f"{bmc_base}/cgi/login.cgi"
+    html5_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5"
+
+    page = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>HTML5 KVM – {ip}</title>
+  <style>
+    body {{ font-family:sans-serif; background:#0d1117; color:#e6edf3;
+            display:flex; flex-direction:column; align-items:center;
+            justify-content:center; min-height:100vh; margin:0; padding:1rem;
+            text-align:center; }}
+    h2  {{ margin-bottom:.5rem; }}
+    p   {{ color:#8b949e; margin:.4rem 0; font-size:.95rem; }}
+    .btn {{ display:inline-block; padding:.55rem 1.4rem; background:#1f6feb;
+             color:#fff; border:none; border-radius:6px; cursor:pointer;
+             font-size:1rem; text-decoration:none; margin:.4rem .2rem; }}
+    .btn:hover {{ background:#388bfd; }}
+    .btn-sec {{ background:#30363d; color:#e6edf3; }}
+    .btn-sec:hover {{ background:#484f58; }}
+    .spinner {{ display:inline-block; width:1rem; height:1rem;
+                border:3px solid #30363d; border-top-color:#0dcaf0;
+                border-radius:50%; animation:spin .8s linear infinite;
+                vertical-align:middle; margin-right:.4rem; }}
+    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+    #step-error {{ display:none; color:#f85149; }}
+    #step-retry {{ display:none; }}
+  </style>
+</head>
+<body>
+  <form id="lf" action="{login_url}" method="post">
+    <input type="hidden" name="name" value="{username}">
+    <input type="hidden" name="pwd"  value="{password}">
+  </form>
+
+  <div id="step-working">
+    <h2>HTML5 KVM — {ip}</h2>
+    <p><span class="spinner"></span><span id="status-msg">Anmeldung am BMC…</span></p>
+  </div>
+
+  <div id="step-retry">
+    <h2>HTML5 KVM — {ip}</h2>
+    <p>Popup-Fenster wurde vom Browser blockiert.</p>
+    <button class="btn" onclick="startLogin()">&#128273; Anmelden &amp; KVM öffnen</button>
+    <br>
+    <a href="{bmc_base}" target="_blank" class="btn btn-sec" style="margin-top:.6rem">BMC direkt öffnen</a>
+  </div>
+
+  <div id="step-error">
+    <h2>Fehler</h2>
+    <p id="error-msg">Anmeldung fehlgeschlagen oder Timeout.</p>
+    <button class="btn" onclick="startLogin()">Erneut versuchen</button>
+    <a href="{bmc_base}" target="_blank" class="btn btn-sec">BMC direkt öffnen</a>
+  </div>
+
+  <script>
+  var CONSOLE_URL = '{html5_url}';
+  var pollTimer   = null;
+  var timeoutId   = null;
+  var loginPopup  = null;
+  var inIframe    = (window.self !== window.top);
+
+  function startLogin() {{
+    document.getElementById('step-retry').style.display   = 'none';
+    document.getElementById('step-error').style.display   = 'none';
+    document.getElementById('step-working').style.display = 'block';
+    document.getElementById('status-msg').textContent = 'Anmeldung am BMC…';
+
+    loginPopup = window.open(
+      'about:blank', 'bmc_login_popup',
+      'width=1,height=1,left=-200,top=-200,menubar=no,toolbar=no,status=no,scrollbars=no'
+    );
+
+    if (!loginPopup) {{
+      document.getElementById('step-working').style.display = 'none';
+      document.getElementById('step-retry').style.display   = 'block';
+      return;
+    }}
+
+    var form = document.getElementById('lf');
+    form.setAttribute('target', 'bmc_login_popup');
+    form.submit();
+
+    pollTimer = setInterval(checkPopup, 150);
+    timeoutId = setTimeout(onTimeout, 15000);
+  }}
+
+  function checkPopup() {{
+    if (!loginPopup || loginPopup.closed) {{
+      clearInterval(pollTimer); pollTimer = null;
+      return;
+    }}
+    try {{
+      var _unused = loginPopup.location.href;
+    }} catch (e) {{
+      // SecurityError: popup navigated to BMC domain — login cookie is set
+      clearInterval(pollTimer); pollTimer = null;
+      clearTimeout(timeoutId);
+      setTimeout(function() {{
+        try {{ loginPopup.close(); }} catch (_) {{}}
+        document.getElementById('status-msg').textContent = 'Öffne HTML5 KVM…';
+        // Notify parent frame (kvmModal) before we navigate away
+        if (inIframe) {{
+          try {{ window.parent.postMessage({{type:'kvm-ready',ip:'{ip}'}}, '*'); }} catch (_) {{}}
+        }}
+        window.location.href = CONSOLE_URL;
+      }}, 300);
+    }}
+  }}
+
+  function onTimeout() {{
+    clearInterval(pollTimer); pollTimer = null;
+    if (loginPopup && !loginPopup.closed) {{ try {{ loginPopup.close(); }} catch(_) {{}} }}
+    document.getElementById('step-working').style.display = 'none';
+    document.getElementById('step-error').style.display   = 'block';
+    document.getElementById('error-msg').textContent =
+      'Timeout — BMC nicht erreichbar oder falsche Zugangsdaten.';
+    if (inIframe) {{
+      try {{ window.parent.postMessage({{type:'kvm-error',ip:'{ip}'}}, '*'); }} catch (_) {{}}
+    }}
+  }}
+
+  startLogin();
+  </script>
+</body>
+</html>"""
+    return Response(page, content_type='text/html')
+
+
 @app.route('/api/servers/<server_id>/jnlp-debug', methods=['GET'])
 def api_jnlp_debug(server_id):
     """Diagnostic endpoint — shows exactly what the BMC returns during login + JNLP fetch."""
@@ -762,7 +910,7 @@ def api_jnlp_debug(server_id):
     for label, url_name, body_limit in [
         ('3_mainmenu',       'mainmenu',       800),
         ('4_topmenu',        'topmenu',        8000),   # need full JS to find KVM cookie values
-        ('5_man_ikvm',       'man_ikvm',       4000),   # Console Redirection page — calls GetIKVMStatus()
+        ('5_man_ikvm',       'man_ikvm',       5000),   # Console Redirection page — calls GetIKVMStatus()
         ('6_remote_control', 'remote_control', 2000),
         ('7_remote_ctrl',    'remote_ctrl',    2000),
     ]:
@@ -830,7 +978,7 @@ def api_jnlp_debug(server_id):
                 'content_type': pg.headers.get('Content-Type', ''),
                 'body_length': len(pg.content),
                 'is_jnlp': '<jnlp' in pg.text.lower(),
-                'body_preview': pg.text[:1200],
+                'body_preview': pg.text[:4500],
             })
         except Exception as e:
             steps.append({'step': step_label, 'error': str(e)})
@@ -866,27 +1014,176 @@ def api_jnlp_debug(server_id):
         try:
             r = sess.get(f"{base}{js_path}", timeout=8)
             if r.status_code == 200 and len(r.text) > 50:
+                txt = r.text
                 # Extract any .jnlp or cgi references from the JS
-                jnlp_refs = re.findall(r'["\']([^"\']*(?:jnlp|ikvm|launch|kvm)[^"\']*)["\']', r.text, re.I)
+                jnlp_refs = re.findall(r'["\']([^"\']*(?:jnlp|ikvm|launch|kvm)[^"\']*)["\']', txt, re.I)
+                # Find ALL quoted strings that look like URL paths
+                all_url_strings = re.findall(r'["\']([^"\']{4,}(?:cgi|jnlp|\.cgi)[^"\']*)["\']', txt, re.I)
                 # Find IKVM_SERVICE definition specifically
-                ikvm_svc_m = re.search(r'IKVM_SERVICE\s*=\s*["\']([^"\']+)["\']', r.text)
-                # Also show the 500 chars around IKVM_SERVICE definition
+                ikvm_svc_m = re.search(r'IKVM_SERVICE\s*=\s*["\']([^"\']+)["\']', txt)
+                # Show 1500 chars around IKVM_SERVICE reference
                 ikvm_svc_ctx = ''
-                m2 = re.search(r'IKVM_SERVICE', r.text)
+                m2 = re.search(r'IKVM_SERVICE', txt)
                 if m2:
-                    ikvm_svc_ctx = r.text[max(0, m2.start()-100):min(len(r.text), m2.end()+400)]
+                    ikvm_svc_ctx = txt[max(0, m2.start()-300):min(len(txt), m2.end()+1200)]
+                # Find the full GetIKVMStatus / get_ikvm_vm_status / GetPortInfo function
+                fn_ctx = ''
+                for fn_pat in (r'function\s+GetIKVMStatus', r'function\s+get_ikvm_vm_status',
+                               r'function\s+GetPortInfo', r'function\s+GetPortStatus',
+                               r'function\s+StartIKVM', r'function\s+LaunchIKVM',
+                               r'function\s+ikvm_launch', r'function\s+OpenKVM'):
+                    m3 = re.search(fn_pat, txt, re.I)
+                    if m3:
+                        fn_ctx += f'\n--- {fn_pat} ---\n'
+                        fn_ctx += txt[m3.start():min(len(txt), m3.start()+3000)]
+                # XMLHttpRequest / fetch calls (to find the URL being polled)
+                xhr_urls = re.findall(r'open\s*\(\s*["\'][A-Z]+["\'],\s*["\']([^"\']+)["\']', txt, re.I)
                 steps.append({
                     'step': f'8_js_{js_path.split("/")[-1]}',
                     'url': js_path,
                     'status': r.status_code,
                     'body_length': len(r.content),
-                    'jnlp_kvm_refs': str(jnlp_refs[:20]),
+                    'jnlp_kvm_refs': str(jnlp_refs[:30]),
+                    'all_cgi_url_strings': str(list(dict.fromkeys(all_url_strings))[:40]),
+                    'xhr_open_urls': str(xhr_urls[:20]),
                     'IKVM_SERVICE_value': ikvm_svc_m.group(1) if ikvm_svc_m else 'not found as string literal',
-                    'IKVM_SERVICE_context': ikvm_svc_ctx,
-                    'body_preview': r.text[:2000],
+                    'IKVM_SERVICE_context_1500': ikvm_svc_ctx,
+                    'kvm_function_bodies': fn_ctx[:6000] if fn_ctx else 'none found',
+                    'body_first_5000': txt[:5000],
+                    'body_5000_10000': txt[5000:10000] if len(txt) > 5000 else '',
+                    'body_10000_15000': txt[10000:15000] if len(txt) > 10000 else '',
                 })
         except Exception:
             pass
+
+    # Step 9: full man_ikvm body (page is ~4042 bytes — show it completely)
+    try:
+        pg9 = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm", timeout=10,
+                       headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu"})
+        steps.append({
+            'step': '9_man_ikvm_full_body',
+            'status': pg9.status_code,
+            'body_length': len(pg9.content),
+            'full_body': pg9.text,  # show everything — it's only ~4KB
+        })
+    except Exception as e:
+        steps.append({'step': '9_man_ikvm_full_body', 'error': str(e)})
+
+    # Step 9b: POST /cgi/ipmi.cgi op=GETPORTSINFO.XML — this is what get_ikvm_vm_status() calls
+    # in utils.js (called from topmenu to check IKVM_SERVICE availability). Try this BEFORE
+    # url_name=ikvm to see if it "activates" the endpoint.
+    try:
+        pg9b = sess.post(
+            f"{base}/cgi/ipmi.cgi",
+            data='op=GETPORTSINFO.XML&r=(0,0)',
+            headers={
+                'Referer':      f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            timeout=8,
+        )
+        steps.append({
+            'step': '9b_ipmi_cgi_GETPORTSINFO',
+            'status': pg9b.status_code,
+            'body_length': len(pg9b.content),
+            'body_preview': pg9b.text[:800],
+        })
+        # Immediately try url_name=ikvm after GETPORTSINFO
+        _sid_now = _pick_sid(sess.cookies)
+        for _lbl, _url in [
+            ('9c_ikvm_after_GETPORTSINFO',
+             f"{base}/cgi/url_redirect.cgi?url_name=ikvm"),
+            ('9d_ikvm_after_GETPORTSINFO_SID',
+             f"{base}/cgi/url_redirect.cgi?url_name=ikvm&SID={_sid_now}" if _sid_now else None),
+        ]:
+            if not _url:
+                continue
+            try:
+                pg = sess.get(_url, timeout=8,
+                              headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"})
+                steps.append({
+                    'step': _lbl, 'url': _url,
+                    'status': pg.status_code,
+                    'content_type': pg.headers.get('Content-Type', ''),
+                    'body_length': len(pg.content),
+                    'is_jnlp': '<jnlp' in pg.text.lower(),
+                    'body_preview': pg.text[:1000],
+                })
+            except Exception as e:
+                steps.append({'step': _lbl, 'error': str(e)})
+    except Exception as e:
+        steps.append({'step': '9b_ipmi_cgi_GETPORTSINFO', 'error': str(e)})
+
+    # Step 9e: man_ikvm_html5 — BMC's built-in HTML5 KVM viewer (no Java required)
+    for _lbl, _url in [
+        ('9e_man_ikvm_html5',        f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5"),
+        ('9f_man_ikvm_html5_novnc',  f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5_novnc"),
+    ]:
+        try:
+            pg = sess.get(_url, timeout=10,
+                          headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu"})
+            steps.append({
+                'step': _lbl, 'url': _url,
+                'status': pg.status_code,
+                'content_type': pg.headers.get('Content-Type', ''),
+                'body_length': len(pg.content),
+                'x_frame_options': pg.headers.get('X-Frame-Options', '(not set)'),
+                'is_jnlp': '<jnlp' in pg.text.lower(),
+                'body_preview': pg.text[:2000],
+            })
+        except Exception as e:
+            steps.append({'step': _lbl, 'error': str(e)})
+
+    # Step 10: alternative JNLP fetch methods
+    _sid = _pick_sid(sess.cookies)
+    alt_attempts = [
+        # POST to man_ikvm (some firmware requires POST to trigger JNLP generation)
+        ('10a_man_ikvm_POST',
+         lambda: sess.post(f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                           data='', headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu"},
+                           timeout=8)),
+        # man_ikvm with JNLP Accept header
+        ('10b_man_ikvm_accept_jnlp',
+         lambda: sess.get(f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                          headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu",
+                                   'Accept': 'application/x-java-jnlp-file,*/*'},
+                          timeout=8)),
+        # CGI_GetJNLPContent.cgi (GET with SID as query param)
+        ('10c_CGI_GetJNLPContent_GET',
+         lambda: sess.get(f"{base}/cgi/CGI_GetJNLPContent.cgi" + (f"?SID={_sid}" if _sid else ''),
+                          timeout=8)),
+        # CGI_GetJNLPContent.cgi POST with SID in body
+        ('10d_CGI_GetJNLPContent_POST',
+         lambda: sess.post(f"{base}/cgi/CGI_GetJNLPContent.cgi",
+                           data=f"SID={_sid}" if _sid else '',
+                           headers={'Content-Type': 'application/x-www-form-urlencoded'},
+                           timeout=8)),
+        # url_redirect with SID in URL + JNLP Accept
+        ('10e_ikvm_SID_jnlp_accept',
+         lambda: sess.get(f"{base}/cgi/url_redirect.cgi?url_name=ikvm" + (f"&SID={_sid}" if _sid else ''),
+                          headers={'Accept': 'application/x-java-jnlp-file,*/*'},
+                          timeout=8)),
+        # GetJNLPContent without CGI prefix
+        ('10f_GetJNLPContent_root',
+         lambda: sess.get(f"{base}/GetJNLPContent.cgi" + (f"?SID={_sid}" if _sid else ''), timeout=8)),
+        # man_ikvm with &action=launch (fictional but worth trying)
+        ('10g_man_ikvm_action_launch',
+         lambda: sess.get(f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm&action=launch",
+                          timeout=8)),
+    ]
+    for label, fn in alt_attempts:
+        try:
+            pg = fn()
+            steps.append({
+                'step': label,
+                'status': pg.status_code,
+                'content_type': pg.headers.get('Content-Type', ''),
+                'body_length': len(pg.content),
+                'is_jnlp': '<jnlp' in pg.text.lower(),
+                'body_preview': pg.text[:800],
+            })
+        except Exception as e:
+            steps.append({'step': label, 'error': str(e)})
 
     result = {
         'server_ip': server['ip'],
