@@ -266,7 +266,12 @@ async function openConsole(serverId) {
     const srv  = state.groups.flatMap(g => g.servers).find(s => s.id === serverId);
 
     document.getElementById('console-server-name').textContent = srv?.name ?? serverId;
-    document.getElementById('console-ikvm-btn').href  = data.ikvm_url;
+
+    // JNLP is proxied through our backend (auto-login) — set as direct href so browser downloads it
+    const jnlpBtn = document.getElementById('console-ikvm-btn');
+    jnlpBtn.href = data.jnlp_proxy;
+    jnlpBtn.removeAttribute('target');  // download in same context
+
     document.getElementById('console-html5-btn').href = data.html5_url;
     document.getElementById('console-bmc-btn').href   = data.bmc_url;
 

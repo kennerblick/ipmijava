@@ -161,8 +161,9 @@
         <div class="modal-body">
           <p class="text-muted small">Wähle die Verbindungsmethode für <strong id="console-server-name"></strong>:</p>
           <div class="d-grid gap-2">
-            <a id="console-ikvm-btn" href="#" target="_blank" class="btn btn-primary" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
-              <i class="bi bi-display me-2"></i>Java iKVM (JNLP) öffnen
+            <a id="console-ikvm-btn" href="#" class="btn btn-primary" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
+              <i class="bi bi-display me-2"></i>Java iKVM herunterladen (.jnlp)
+              <small class="d-block opacity-75" style="font-size:.7rem;">Backend meldet sich am BMC an</small>
             </a>
             <a id="console-html5-btn" href="#" target="_blank" class="btn btn-outline-info" onclick="bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide()">
               <i class="bi bi-browser-chrome me-2"></i>HTML5 KVM öffnen (neuere BMCs)

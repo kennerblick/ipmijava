@@ -1,11 +1,17 @@
 import json
 import os
+import re
 import socket
 import subprocess
 import uuid
 import ipaddress
 import concurrent.futures
-from flask import Flask, jsonify, request, send_from_directory
+
+import requests as req_lib
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+from flask import Flask, jsonify, request, send_from_directory, Response
 
 app = Flask(__name__)
 CONFIG_PATH = os.environ.get('CONFIG_PATH', '/config/servers.json')
@@ -223,10 +229,93 @@ def api_console_url(server_id):
     if not server:
         return jsonify({'error': 'Nicht gefunden'}), 404
     return jsonify({
-        'ikvm_url':  f"https://{server['ip']}/cgi/url_redirect.cgi?url_name=ikvm",
-        'html5_url': f"https://{server['ip']}/kvm.html",
-        'bmc_url':   f"https://{server['ip']}",
+        'jnlp_proxy': f"/api/servers/{server_id}/jnlp",
+        'html5_url':  f"https://{server['ip']}/kvm.html",
+        'bmc_url':    f"https://{server['ip']}",
     })
+
+
+@app.route('/api/servers/<server_id>/jnlp', methods=['GET'])
+def api_console_jnlp(server_id):
+    """Log in to the BMC, fetch the iKVM JNLP, and proxy it back to the browser.
+
+    This solves the 'session timed out' error: the browser never touches the BMC
+    directly for the JNLP download — our backend authenticates and delivers the file.
+    Java Web Start then connects directly from the client to the BMC for the KVM stream.
+    """
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Server nicht gefunden'}), 404
+
+    base = f"https://{server['ip']}"
+    sess = req_lib.Session()
+    sess.verify = False  # BMCs use self-signed certificates
+
+    try:
+        # Step 1: authenticate
+        login = sess.post(
+            f"{base}/cgi/login.cgi",
+            data={'name': server['username'], 'pwd': server['password']},
+            timeout=10,
+            allow_redirects=True,
+        )
+        # Detect login failure (BMC returns HTML with error text, not HTTP 4xx)
+        if any(phrase in login.text.lower() for phrase in ('invalid', 'fail', 'error', 'incorrect')):
+            return _jnlp_error(server['ip'], 'Login fehlgeschlagen – Benutzername/Passwort prüfen.')
+
+        # Step 2: fetch JNLP (session cookie is now set in sess)
+        jnlp_resp = sess.get(
+            f"{base}/cgi/url_redirect.cgi?url_name=ikvm",
+            timeout=10,
+        )
+
+        content = jnlp_resp.text
+        # Detect session-expired response instead of JNLP XML
+        if 'timed out' in content.lower() or ('<jnlp' not in content.lower() and len(content) < 2000):
+            # Fallback: try SID via URL parameter (supported on some firmware versions)
+            sid = sess.cookies.get('SID') or sess.cookies.get('sid')
+            if sid:
+                jnlp_resp = sess.get(
+                    f"{base}/cgi/url_redirect.cgi?url_name=ikvm&SID={sid}",
+                    timeout=10,
+                )
+                content = jnlp_resp.text
+
+        if '<jnlp' not in content.lower():
+            return _jnlp_error(server['ip'], 'BMC lieferte keine JNLP-Datei. '
+                               'Möglicherweise ist kein Java iKVM verfügbar (nur HTML5 KVM?).')
+
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', server['name'])
+        return Response(
+            jnlp_resp.content,
+            content_type='application/x-java-jnlp-file',
+            headers={
+                'Content-Disposition': f'attachment; filename="{safe_name}.jnlp"',
+                'Cache-Control': 'no-store',
+            },
+        )
+
+    except req_lib.exceptions.SSLError:
+        return _jnlp_error(server['ip'], 'SSL-Fehler beim Verbinden mit BMC (selbstsigniertes Zertifikat).')
+    except req_lib.exceptions.ConnectionError:
+        return _jnlp_error(server['ip'], f'BMC nicht erreichbar: {server["ip"]}')
+    except req_lib.exceptions.Timeout:
+        return _jnlp_error(server['ip'], 'Timeout beim Verbinden mit BMC.')
+    except Exception as e:
+        return _jnlp_error(server['ip'], str(e))
+
+
+def _jnlp_error(ip: str, message: str) -> Response:
+    html = f"""<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+<title>KVM Fehler</title>
+<style>body{{font-family:sans-serif;padding:2rem;background:#0d1117;color:#e6edf3}}
+  h2{{color:#f85149}}a{{color:#79b8ff}}</style></head><body>
+<h2>KVM Konsolenfehler</h2>
+<p>{message}</p>
+<p><a href="https://{ip}" target="_blank">BMC Web-Interface direkt öffnen &rarr;</a></p>
+</body></html>"""
+    return Response(html, content_type='text/html', status=502)
 
 
 # ── Network Scan ──────────────────────────────────────────────────────────────────
