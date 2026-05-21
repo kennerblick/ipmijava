@@ -250,9 +250,9 @@ _JNLP_PATHS = [
     '/kvm.jnlp',
 ]
 
-# url_name values that are menus/pages — skip when scanning mainmenu for KVM links
+# url_name values that are navigation frames/pages — skip as JNLP candidates
 _MENU_NAMES = frozenset({
-    'mainmenu', 'index', 'login', 'logout', 'top', 'home',
+    'mainmenu', 'topmenu', 'index', 'login', 'logout', 'top', 'home',
     'sol', 'virtual_media', 'bmc_update', 'bios_update',
     'maintenance', 'network', 'user_management',
 })
@@ -349,37 +349,53 @@ def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Re
 
 
 def _fetch_jnlp_from_mainmenu(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Response | None:
-    """Parse the BMC mainmenu page for JNLP or KVM URL references."""
-    try:
-        r = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", timeout=10)
-        text = r.text
-    except Exception:
-        return None
+    """Scan multiple BMC navigation pages for JNLP links or KVM url_name values.
 
-    # 1. Direct .jnlp href/src references
-    for m in re.finditer(r'(?:href|src|action)\s*=\s*["\']([^"\']+\.jnlp[^"\']*)["\']', text, re.I):
-        url = m.group(1)
-        if not url.startswith('http'):
-            url = f"{base}/{url.lstrip('/')}"
+    ATEN framesets use mainmenu → topmenu → section pages. We scan all of them
+    to discover firmware-specific url_name values for the KVM/iKVM feature.
+    """
+    # Pages to scan for KVM links (frameset pages that reference section URLs)
+    scan_pages = [
+        '/cgi/url_redirect.cgi?url_name=mainmenu',
+        '/cgi/url_redirect.cgi?url_name=topmenu',
+        '/cgi/url_redirect.cgi?url_name=remote_control',
+        '/cgi/url_redirect.cgi?url_name=remote_ctrl',
+    ]
+
+    all_url_names: set[str] = set()
+
+    for rel_path in scan_pages:
         try:
-            resp = sess.get(url, timeout=8)
-            if '<jnlp' in resp.text.lower():
-                return resp
+            r = sess.get(f"{base}{rel_path}", timeout=10)
         except Exception:
             continue
+        text = r.text
 
-    # 2. url_name= values in JavaScript/HTML not in the skip list
-    found_names = {m.group(1).lower() for m in re.finditer(r'url_name=([a-zA-Z_0-9]+)', text)}
-    kvm_candidates = [n for n in found_names if n not in _MENU_NAMES]
+        # Direct .jnlp href/src/location references
+        for m in re.finditer(r'(?:href|src|action|location)\s*[=:]\s*["\']([^"\']+\.jnlp[^"\']*)["\']', text, re.I):
+            url = m.group(1)
+            if not url.startswith('http'):
+                url = f"{base}/{url.lstrip('/')}"
+            try:
+                resp = sess.get(url, timeout=8)
+                if '<jnlp' in resp.text.lower():
+                    return resp
+            except Exception:
+                continue
 
-    # Prioritise names that look KVM-related
-    kvm_candidates.sort(key=lambda n: 0 if any(k in n for k in ('kvm', 'ikvm', 'iview', 'java')) else 1)
+        # Collect all url_name= values from JS/HTML
+        for m in re.finditer(r'url_name=([a-zA-Z_0-9]+)', text):
+            all_url_names.add(m.group(1).lower())
 
-    for name in kvm_candidates:
-        urls_to_try = [f"{base}/cgi/url_redirect.cgi?url_name={name}"]
-        if sid:
-            urls_to_try.append(f"{base}/cgi/url_redirect.cgi?url_name={name}&SID={sid}")
-        for url in urls_to_try:
+    # Remove known navigation/menu names, sort KVM-like names first
+    candidates = sorted(
+        [n for n in all_url_names if n not in _MENU_NAMES],
+        key=lambda n: 0 if any(k in n for k in ('kvm', 'ikvm', 'iview', 'java', 'remote', 'console', 'virtual')) else 1,
+    )
+
+    for name in candidates:
+        for url in ([f"{base}/cgi/url_redirect.cgi?url_name={name}"] +
+                    ([f"{base}/cgi/url_redirect.cgi?url_name={name}&SID={sid}"] if sid else [])):
             try:
                 resp = sess.get(url, timeout=8)
                 if '<jnlp' in resp.text.lower():
@@ -509,21 +525,27 @@ def api_jnlp_debug(server_id):
             except Exception as e:
                 steps.append({'step': 'jnlp_try', 'url': url, 'error': str(e)})
 
-    # Step 3: fetch mainmenu and show all url_name= references found
-    try:
-        mm = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", timeout=10)
-        all_names = sorted({m.group(1) for m in re.finditer(r'url_name=([a-zA-Z_0-9]+)', mm.text)})
-        jnlp_hrefs = re.findall(r'(?:href|src)=["\']([^"\']+\.jnlp[^"\']*)["\']', mm.text, re.I)
-        steps.append({
-            'step': '3_mainmenu_scan',
-            'status': mm.status_code,
-            'body_length': len(mm.content),
-            'url_names_found': str(all_names),
-            'jnlp_hrefs_found': str(jnlp_hrefs),
-            'body_preview': mm.text[:800],
-        })
-    except Exception as e:
-        steps.append({'step': '3_mainmenu_scan', 'error': str(e)})
+    # Step 3+: scan all navigation pages and show url_name values + body
+    for label, url_name in [
+        ('3_mainmenu', 'mainmenu'),
+        ('4_topmenu',  'topmenu'),
+        ('5_remote_control', 'remote_control'),
+    ]:
+        try:
+            pg = sess.get(f"{base}/cgi/url_redirect.cgi?url_name={url_name}", timeout=10)
+            names = sorted({m.group(1) for m in re.finditer(r'url_name=([a-zA-Z_0-9]+)', pg.text)})
+            jnlp_h = re.findall(r'(?:href|src)=["\']([^"\']+\.jnlp[^"\']*)["\']', pg.text, re.I)
+            steps.append({
+                'step': label,
+                'url': f"/cgi/url_redirect.cgi?url_name={url_name}",
+                'status': pg.status_code,
+                'body_length': len(pg.content),
+                'url_names_found': str(names),
+                'jnlp_hrefs_found': str(jnlp_h),
+                'body_preview': pg.text[:1200],
+            })
+        except Exception as e:
+            steps.append({'step': label, 'error': str(e)})
 
     result = {
         'server_ip': server['ip'],
