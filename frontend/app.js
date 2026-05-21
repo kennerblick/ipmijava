@@ -184,8 +184,11 @@ function serverCardHtml(server, status, groupId) {
 
           <!-- Secondary actions -->
           <div class="d-flex gap-1">
-            <button class="btn btn-sm btn-outline-info flex-grow-1" onclick="openConsole('${server.id}')" title="KVM Konsole">
-              <i class="bi bi-display"></i> KVM
+            <button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="KVM im Browser (Docker-Proxy)">
+              <i class="bi bi-display"></i>
+            </button>
+            <button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Java iKVM / BMC-Optionen">
+              <i class="bi bi-window"></i>
             </button>
             <button class="btn btn-sm btn-outline-secondary" onclick="fetchStatus('${server.id}')" title="Status aktualisieren">
               <i class="bi bi-arrow-clockwise"></i>
@@ -501,6 +504,88 @@ function showToast(msg, type = 'info') {
   const t = new bootstrap.Toast(el, { delay: 4500 });
   t.show();
   el.addEventListener('hidden.bs.toast', () => el.remove());
+}
+
+
+// ── KVM Browser ──────────────────────────────────────────────────────────────
+
+let _kvmServerId  = null;
+let _kvmPollTimer = null;
+let _kvmModal     = null;
+
+async function openKvm(serverId) {
+  const srv = state.groups.flatMap(g => g.servers).find(s => s.id === serverId);
+  _kvmServerId = serverId;
+
+  document.getElementById('kvm-server-name').textContent = srv?.name ?? serverId;
+  document.getElementById('kvm-loading').style.display   = 'block';
+  document.getElementById('kvm-frame').style.display     = 'none';
+  document.getElementById('kvm-frame').src               = 'about:blank';
+  _kvmSetBadge('secondary', 'Starte…');
+  document.getElementById('kvm-loading-msg').textContent = 'Starte KVM-Session…';
+
+  _kvmModal = new bootstrap.Modal(document.getElementById('kvmModal'));
+  _kvmModal.show();
+
+  try {
+    const r = await apiPost(`/servers/${serverId}/kvm-session`, {});
+    if (r.status === 'running') {
+      _kvmShowFrame(r.ws_port);
+    } else if (r.status === 'error') {
+      _kvmError(r.error || 'Unbekannter Fehler');
+    } else {
+      _kvmPoll(serverId);
+    }
+  } catch (e) {
+    _kvmError(e.message);
+  }
+}
+
+function _kvmPoll(serverId) {
+  if (_kvmPollTimer) clearInterval(_kvmPollTimer);
+  _kvmPollTimer = setInterval(async () => {
+    try {
+      const r = await apiGet(`/servers/${serverId}/kvm-session`);
+      if (r.status === 'running') {
+        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
+        _kvmShowFrame(r.ws_port);
+      } else if (r.status === 'error') {
+        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
+        _kvmError(r.error || 'Fehler beim Starten');
+      }
+    } catch (_) { /* ignore poll errors */ }
+  }, 1200);
+}
+
+function _kvmShowFrame(wsPort) {
+  const host = window.location.hostname;
+  const url  = `/novnc/vnc.html?host=${encodeURIComponent(host)}&port=${wsPort}&autoconnect=true&resize=scale&reconnect=true`;
+  document.getElementById('kvm-loading').style.display = 'none';
+  const frame = document.getElementById('kvm-frame');
+  frame.src   = url;
+  frame.style.display = 'block';
+  _kvmSetBadge('success', 'Verbunden');
+}
+
+function _kvmError(msg) {
+  document.getElementById('kvm-loading-msg').textContent = 'Fehler: ' + msg;
+  document.getElementById('kvm-loading').querySelector('div.spinner-border').style.display = 'none';
+  _kvmSetBadge('danger', 'Fehler');
+}
+
+function _kvmSetBadge(type, label) {
+  const el = document.getElementById('kvm-status-badge');
+  el.className = `badge bg-${type}`;
+  el.textContent = label;
+}
+
+function closeKvm() {
+  if (_kvmPollTimer) { clearInterval(_kvmPollTimer); _kvmPollTimer = null; }
+  document.getElementById('kvm-frame').src = 'about:blank';
+  if (_kvmServerId) {
+    apiDelete(`/servers/${_kvmServerId}/kvm-session`).catch(() => {});
+    _kvmServerId = null;
+  }
 }
 
 

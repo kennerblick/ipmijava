@@ -3,6 +3,7 @@ import os
 import re
 import socket
 import subprocess
+import sys
 import uuid
 import ipaddress
 import concurrent.futures
@@ -16,6 +17,15 @@ from flask import Flask, jsonify, request, send_from_directory, Response
 app = Flask(__name__)
 CONFIG_PATH = os.environ.get('CONFIG_PATH', '/config/servers.json')
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend')
+
+# kvm.py sits next to app.py — add its directory to sys.path for direct import
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import kvm as _kvm
+    _KVM_AVAILABLE = True
+except Exception:
+    _kvm = None  # type: ignore
+    _KVM_AVAILABLE = False
 
 
 # ── Config ─────────────────────────────────────────────────────────────────────
@@ -915,6 +925,61 @@ def _jnlp_error(ip: str, message: str, debug_url: str = '') -> Response:
 <p><a href="https://{ip}" target="_blank">BMC Web-Interface direkt öffnen &rarr;</a></p>
 </body></html>"""
     return Response(html, content_type='text/html', status=502)
+
+
+# ── KVM Browser Sessions ─────────────────────────────────────────────────────────
+
+@app.route('/api/servers/<server_id>/kvm-session', methods=['POST'])
+def api_kvm_start(server_id):
+    if not _KVM_AVAILABLE:
+        return jsonify({'error': 'KVM nicht verfügbar (Xvfb/x11vnc nicht installiert)'}), 503
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Nicht gefunden'}), 404
+
+    existing = _kvm.get_session_for_server(server_id)
+    if existing:
+        return jsonify({
+            'session_id': existing.session_id,
+            'ws_port':    existing.port_ws,
+            'status':     existing.status,
+            'error':      existing.error,
+        })
+
+    try:
+        sess = _kvm.start_session(server, _bmc_login, _fetch_jnlp)
+        return jsonify({
+            'session_id': sess.session_id,
+            'ws_port':    sess.port_ws,
+            'status':     sess.status,
+        }), 201
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 503
+
+
+@app.route('/api/servers/<server_id>/kvm-session', methods=['GET'])
+def api_kvm_status(server_id):
+    if not _KVM_AVAILABLE:
+        return jsonify({'status': 'unavailable'}), 503
+    sess = _kvm.get_session_for_server(server_id)
+    if not sess:
+        return jsonify({'status': 'none'}), 404
+    return jsonify({
+        'session_id': sess.session_id,
+        'ws_port':    sess.port_ws,
+        'status':     sess.status,
+        'error':      sess.error,
+    })
+
+
+@app.route('/api/servers/<server_id>/kvm-session', methods=['DELETE'])
+def api_kvm_stop(server_id):
+    if _KVM_AVAILABLE:
+        sess = _kvm.get_session_for_server(server_id)
+        if sess:
+            _kvm.stop_session(sess.session_id)
+    return '', 204
 
 
 # ── Network Scan ──────────────────────────────────────────────────────────────────
