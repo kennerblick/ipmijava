@@ -546,6 +546,7 @@ function _kvmPoll(serverId) {
   _kvmPollTimer = setInterval(async () => {
     try {
       const r = await apiGet(`/servers/${serverId}/kvm-session`);
+      if (r.message) document.getElementById('kvm-loading-msg').textContent = r.message;
       if (r.status === 'running') {
         clearInterval(_kvmPollTimer); _kvmPollTimer = null;
         _kvmShowFrame(r.ws_port);

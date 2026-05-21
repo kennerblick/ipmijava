@@ -944,15 +944,17 @@ def api_kvm_start(server_id):
             'session_id': existing.session_id,
             'ws_port':    existing.port_ws,
             'status':     existing.status,
+            'message':    existing.message,
             'error':      existing.error,
         })
 
     try:
-        sess = _kvm.start_session(server, _bmc_login, _fetch_jnlp)
+        sess = _kvm.start_session(server)
         return jsonify({
             'session_id': sess.session_id,
             'ws_port':    sess.port_ws,
             'status':     sess.status,
+            'message':    sess.message,
         }), 201
     except RuntimeError as e:
         return jsonify({'error': str(e)}), 503
@@ -969,6 +971,7 @@ def api_kvm_status(server_id):
         'session_id': sess.session_id,
         'ws_port':    sess.port_ws,
         'status':     sess.status,
+        'message':    sess.message,
         'error':      sess.error,
     })
 

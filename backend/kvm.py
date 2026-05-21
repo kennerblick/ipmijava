@@ -6,10 +6,11 @@ Each session owns:
   - a websockify WebSocket→TCP bridge
   - a Java process running the iKVM JAR directly (no javaws)
 
-Sessions are tracked in-process; use a single gunicorn worker.
+Sessions are tracked in-process; gunicorn must run with a single worker.
 """
 
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -21,7 +22,11 @@ import xml.etree.ElementTree as ET
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
+
+import requests as _req
+import urllib3 as _urllib3
+_urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -31,10 +36,31 @@ _PORT_WS_START  = 6080
 _MAX_SESSIONS   = 10
 _RESOLUTION     = '1280x800x24'
 
+_BROWSER_UA = (
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 '
+    '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+)
+
+# JNLP URL candidates — tried in order, most common first
+_JNLP_PATHS = [
+    '/cgi/url_redirect.cgi?url_name=ikvm',
+    '/cgi/url_redirect.cgi?url_name=launch',
+    '/cgi/url_redirect.cgi?url_name=java_iview',
+    '/cgi/url_redirect.cgi?url_name=iview',
+    '/cgi/url_redirect.cgi?url_name=kvm',
+    '/cgi/url_redirect.cgi?url_name=kvmjnlp',
+    '/cgi/CGI_GetJNLPContent.cgi',
+    '/cgi/getJNLP.cgi',
+    '/cgi/ikvm.cgi',
+    '/launch.jnlp',
+    '/iKVM.jnlp',
+    '/iKVM/iKVM.jnlp',
+]
+
 # ── State ─────────────────────────────────────────────────────────────────────
 
-_lock: threading.Lock = threading.Lock()
-_sessions: dict = {}  # session_id -> KvmSession
+_lock:     threading.Lock = threading.Lock()
+_sessions: dict           = {}   # session_id -> KvmSession
 
 
 # ── Data class ────────────────────────────────────────────────────────────────
@@ -47,9 +73,10 @@ class KvmSession:
     port_vnc:   int
     port_ws:    int
     tmpdir:     str
-    procs:  list = field(default_factory=list)
-    status: str  = 'starting'   # starting | running | error | stopped
-    error:  str  = ''
+    procs:   list = field(default_factory=list)
+    status:  str  = 'starting'   # starting | running | error | stopped
+    message: str  = 'Initialisiere…'
+    error:   str  = ''
 
 
 # ── Allocation helpers ────────────────────────────────────────────────────────
@@ -67,7 +94,7 @@ def _alloc_display() -> int:
     for d in range(_DISPLAY_START, _DISPLAY_START + _MAX_SESSIONS):
         if d not in used and not Path(f'/tmp/.X{d}-lock').exists():
             return d
-    raise RuntimeError('Kein freies X-Display verfügbar')
+    raise RuntimeError('Kein freies X-Display')
 
 
 def _alloc_port(start: int) -> int:
@@ -81,11 +108,125 @@ def _alloc_port(start: int) -> int:
     raise RuntimeError(f'Kein freier Port ab {start}')
 
 
+# ── BMC login (simplified, fast — no browser-state simulation needed) ────────
+
+def _bmc_login(base: str, username: str, password: str) -> tuple:
+    """Login to BMC, return (requests.Session, sid_or_None).
+
+    Handles both ATEN legacy (SID in HTML body) and AMI MegaRAC (SID cookie).
+    Intentionally avoids the expensive browser navigation simulation used by
+    the browser-relay endpoint — for the proxy we only need the SID.
+    """
+    sess = _req.Session()
+    sess.verify = False
+    sess.headers['User-Agent'] = _BROWSER_UA
+
+    try:
+        r = sess.post(
+            f"{base}/cgi/login.cgi",
+            data={'name': username, 'pwd': password},
+            timeout=10,
+            allow_redirects=True,
+        )
+    except Exception as e:
+        raise RuntimeError(f"BMC nicht erreichbar: {e}")
+
+    # SID from cookie (AMI) or HTML body (ATEN legacy)
+    sid = None
+    for name in ('SID', 'sid', 'QSESSIONID'):
+        v = sess.cookies.get(name) or r.cookies.get(name)
+        if v:
+            sid = v
+            break
+    if not sid:
+        for pat in (r'[?&]SID=([a-fA-F0-9]+)',
+                    r'[Ss][Ii][Dd]\s*[=:]\s*[\'"]([a-fA-F0-9]{8,})'):
+            m = re.search(pat, r.text)
+            if m:
+                sid = m.group(1)
+                break
+
+    if sid:
+        sess.cookies.set('SID', sid)
+
+    return sess, sid
+
+
+def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Optional[_req.Response]:
+    """Fetch JNLP from BMC.
+
+    Pass 1 – direct paths (no navigation; works for X8/X9/X10 with SID cookie).
+    Pass 2 – minimal navigation to man_ikvm + single poll (needed for newer AMI
+              firmware that checks session state before serving url_name=ikvm).
+    """
+    jnlp_ref = f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"
+
+    def _try_paths(extra_header=None):
+        hdrs = {'Referer': jnlp_ref} if extra_header else {}
+        for path in _JNLP_PATHS:
+            candidates = [f"{base}{path}"]
+            if sid:
+                sep = '&' if '?' in path else '?'
+                candidates.append(f"{base}{path}{sep}SID={sid}")
+            for url in candidates:
+                try:
+                    r = sess.get(url, timeout=6, headers=hdrs)
+                    if '<jnlp' in r.text.lower():
+                        return r
+                except Exception:
+                    continue
+        return None
+
+    if progress_fn:
+        progress_fn('Suche JNLP (direkte Pfade)…')
+    result = _try_paths()
+    if result:
+        return result
+
+    # Minimal navigation — skip expensive topmenu/man_ikvm scraping
+    if progress_fn:
+        progress_fn('BMC-Navigation (man_ikvm + poll)…')
+
+    topmenu_url = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
+    for url, timeout in [
+        (f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", 4),
+        (topmenu_url, 5),
+    ]:
+        try:
+            sess.get(url, timeout=timeout)
+        except Exception:
+            pass
+
+    sess.cookies.set('mainpage', 'remote')
+    sess.cookies.set('subpage',  'man_ikvm')
+
+    try:
+        sess.get(jnlp_ref, timeout=8, headers={'Referer': topmenu_url})
+    except Exception:
+        pass
+
+    try:
+        sess.post(
+            f"{base}/cgi/upgrade_process.cgi",
+            data='fwtype=255',
+            headers={
+                'Content-Type': 'application/x-www-form-urlencoded',
+                'Referer': jnlp_ref,
+            },
+            timeout=6,
+        )
+    except Exception:
+        pass
+
+    if progress_fn:
+        progress_fn('Suche JNLP (nach Navigation)…')
+    return _try_paths(extra_header=True)
+
+
 # ── JNLP parser ───────────────────────────────────────────────────────────────
 
 def _parse_jnlp(text: str, base: str) -> tuple:
     """Return (jar_urls, nativelib_urls, main_class, arguments)."""
-    # Strip namespace prefixes so ElementTree queries stay simple
     text = text.replace(' xmlns=', ' _xmlns=')
     root = ET.fromstring(text)
     codebase = root.get('codebase', base).rstrip('/')
@@ -102,18 +243,15 @@ def _parse_jnlp(text: str, base: str) -> tuple:
             elif el.tag == 'jar':
                 jars.append(url)
 
-    app_el = root.find('.//application-desc')
-    main_class = app_el.get('main-class', '') if app_el is not None else ''
-    arguments  = [a.text or '' for a in (app_el.findall('argument') if app_el is not None else [])]
-
-    return jars, native_jars, main_class, arguments
+    app_el    = root.find('.//application-desc')
+    main_cls  = app_el.get('main-class', '') if app_el is not None else ''
+    arguments = [a.text or '' for a in (app_el.findall('argument') if app_el is not None else [])]
+    return jars, native_jars, main_cls, arguments
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def start_session(server: dict,
-                  bmc_login_fn: Callable,
-                  jnlp_fetch_fn: Callable) -> KvmSession:
+def start_session(server: dict) -> 'KvmSession':
     """Allocate a session and launch it in a background thread."""
     with _lock:
         active = [s for s in _sessions.values() if s.status in ('starting', 'running')]
@@ -129,18 +267,18 @@ def start_session(server: dict,
 
     threading.Thread(
         target=_run,
-        args=(sess, server, bmc_login_fn, jnlp_fetch_fn),
+        args=(sess, server),
         daemon=True,
         name=f'kvm-{sid}',
     ).start()
     return sess
 
 
-def get_session(session_id: str) -> Optional[KvmSession]:
+def get_session(session_id: str) -> Optional['KvmSession']:
     return _sessions.get(session_id)
 
 
-def get_session_for_server(server_id: str) -> Optional[KvmSession]:
+def get_session_for_server(server_id: str) -> Optional['KvmSession']:
     for s in _sessions.values():
         if s.server_id == server_id and s.status in ('starting', 'running'):
             return s
@@ -156,22 +294,27 @@ def stop_session(session_id: str) -> None:
 
 # ── Session lifecycle ─────────────────────────────────────────────────────────
 
-def _run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None:
+def _run(sess: 'KvmSession', server: dict) -> None:
     try:
-        _do_run(sess, server, bmc_login_fn, jnlp_fetch_fn)
+        _do_run(sess, server)
     except Exception as e:
-        sess.status = 'error'
-        sess.error  = str(e)
+        sess.status  = 'error'
+        sess.error   = str(e)
+        sess.message = f'Fehler: {e}'
         _kill(sess)
         _sessions.pop(sess.session_id, None)
 
 
-def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None:
+def _do_run(sess: 'KvmSession', server: dict) -> None:
     base   = f"https://{server['ip']}"
     tmpdir = Path(sess.tmpdir)
     disp   = f':{sess.display}'
 
-    # 1 ── Xvfb
+    def msg(text: str) -> None:
+        sess.message = text
+
+    # ── 1. Xvfb ──────────────────────────────────────────────────────────────
+    msg('Starte Xvfb (virtuelles Display)…')
     xvfb = subprocess.Popen(
         ['Xvfb', disp, '-screen', '0', _RESOLUTION, '-ac', '+extension', 'GLX'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -181,7 +324,8 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
     if xvfb.poll() is not None:
         raise RuntimeError('Xvfb konnte nicht gestartet werden')
 
-    # 2 ── x11vnc
+    # ── 2. x11vnc ─────────────────────────────────────────────────────────────
+    msg('Starte VNC-Server (x11vnc)…')
     vnc = subprocess.Popen(
         ['x11vnc', '-display', disp,
          '-rfbport', str(sess.port_vnc),
@@ -191,7 +335,8 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
     sess.procs.append(vnc)
     time.sleep(0.4)
 
-    # 3 ── websockify (WebSocket → VNC TCP bridge)
+    # ── 3. websockify ─────────────────────────────────────────────────────────
+    msg(f'Starte WebSocket-Proxy (Port {sess.port_ws})…')
     ws = subprocess.Popen(
         ['websockify', str(sess.port_ws), f'127.0.0.1:{sess.port_vnc}'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -199,21 +344,32 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
     sess.procs.append(ws)
     time.sleep(0.3)
 
-    # 4 ── BMC login + JNLP download
-    http_sess, sid = bmc_login_fn(base, server['username'], server['password'])
-    resp = jnlp_fetch_fn(http_sess, base, sid)
-    if not resp or '<jnlp' not in resp.text.lower():
-        raise RuntimeError('Kein JNLP vom BMC erhalten — Login fehlgeschlagen?')
+    # ── 4. BMC login ──────────────────────────────────────────────────────────
+    msg(f'Login am BMC {server["ip"]}…')
+    http_sess, sid = _bmc_login(base, server['username'], server['password'])
 
-    # 5 ── Parse JNLP
+    # ── 5. JNLP fetch ─────────────────────────────────────────────────────────
+    resp = _fetch_jnlp(http_sess, base, sid, progress_fn=msg)
+    if not resp or '<jnlp' not in resp.text.lower():
+        raise RuntimeError(
+            f'JNLP nicht gefunden — BMC Login OK (SID: {"ja" if sid else "nein"}), '
+            'aber keiner der JNLP-Pfade hat geantwortet. '
+            'BMC-Firmware-Version prüfen oder Debug-Endpoint nutzen.'
+        )
+
+    # ── 6. Parse JNLP ─────────────────────────────────────────────────────────
+    msg('Analysiere JNLP…')
     jars, native_jars, main_class, arguments = _parse_jnlp(resp.text, base)
     if not main_class:
-        raise RuntimeError('Keine main-class im JNLP')
+        raise RuntimeError(
+            f'Keine main-class im JNLP. JNLP-Inhalt (Anfang): {resp.text[:300]}'
+        )
 
-    # 6 ── Download JARs
+    # ── 7. JARs herunterladen ─────────────────────────────────────────────────
     cp_paths = []
-    for url in jars:
-        name = url.split('/')[-1].split('?')[0] or 'ikvm.jar'
+    for i, url in enumerate(jars, 1):
+        name = url.split('/')[-1].split('?')[0] or f'ikvm{i}.jar'
+        msg(f'Lade JAR {i}/{len(jars)}: {name}…')
         dest = tmpdir / name
         r = http_sess.get(url, timeout=30)
         r.raise_for_status()
@@ -223,9 +379,10 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
     if not cp_paths:
         raise RuntimeError('Keine JARs im JNLP gefunden')
 
-    # 7 ── Download + extract native JARs (.so files)
+    # ── 8. Native JARs (*.so) extrahieren ─────────────────────────────────────
     for url in native_jars:
         name = url.split('/')[-1].split('?')[0] or 'native.jar'
+        msg(f'Lade Native-JAR: {name}…')
         dest = tmpdir / name
         r = http_sess.get(url, timeout=30)
         r.raise_for_status()
@@ -238,7 +395,8 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
         except Exception:
             pass
 
-    # 8 ── Launch Java
+    # ── 9. Java starten ───────────────────────────────────────────────────────
+    msg(f'Starte Java ({main_class.split(".")[-1]})…')
     env = os.environ.copy()
     env['DISPLAY'] = disp
 
@@ -247,8 +405,11 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
         f'-Djava.library.path={tmpdir}',
         '-Dawt.useSystemAAFontSettings=on',
         '-Dswing.aatext=true',
-        # Allow AWT from headless JRE variants
         '-Djava.awt.headless=false',
+        # For older JARs that use reflection internals (Java 9+ module guard)
+        '--add-opens=java.base/java.lang=ALL-UNNAMED',
+        '--add-opens=java.desktop/sun.awt=ALL-UNNAMED',
+        '--add-opens=java.desktop/java.awt=ALL-UNNAMED',
         '-cp', ':'.join(cp_paths),
         main_class,
     ] + arguments
@@ -259,14 +420,16 @@ def _do_run(sess: KvmSession, server: dict, bmc_login_fn, jnlp_fetch_fn) -> None
         cwd=str(tmpdir),
     )
     sess.procs.append(java)
-    sess.status = 'running'
+    sess.status  = 'running'
+    sess.message = f'Java läuft (PID {java.pid}) — iKVM wird geladen…'
 
-    # Block until Java exits, then clean up automatically
+    # Wait for Java to exit, then auto-cleanup
     java.wait()
+    sess.message = 'Java beendet'
     stop_session(sess.session_id)
 
 
-def _kill(sess: KvmSession) -> None:
+def _kill(sess: 'KvmSession') -> None:
     for p in reversed(sess.procs):
         try:
             p.terminate()
