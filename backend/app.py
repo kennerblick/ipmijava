@@ -315,32 +315,93 @@ foreach ($key in $needed.Keys) {{
 
 $lines | Set-Content $propsFile -Encoding UTF8
 
-# --- 4. Optional: SHA1 in java.security entsperren -----------------------------
-#  (erfordert Admin-Rechte; wird uebersprungen wenn keine Rechte vorhanden)
-$javaHomes = @(
-    "$env:JAVA_HOME",
-    (Get-Command javaws -ErrorAction SilentlyContinue)?.Source | Split-Path | Split-Path
-) + (Get-ChildItem 'C:\\Program Files\\Java' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+# --- 4. SHA1 in java.security entsperren ----------------------------------------
+#  Betrifft jdk.jar.disabledAlgorithms UND jdk.certpath.disabledAlgorithms.
+#  Versucht erst per-user override (kein Admin noetig), dann die JRE-Datei direkt.
+#
+#  Typische SHA1-Tokens in java.security (alle Varianten):
+#    SHA1 jdkCA & usage TLSServer, SHA1 jdkCA, SHA1 denyAfter 2019-01-01, SHA1
+#  Wir entfernen alles zwischen "SHA1" und dem naechsten "," oder Zeilenende.
 
+function Remove-SHA1Restrictions {{
+    param([string]$Path)
+    $changed = $false
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+
+    # Zeilenfortsetzungen (\ am Zeilenende) zusammenfuehren, damit Regex einfacher wird
+    $joined = $text -replace '\\\s*\r?\n\s*', ' '
+
+    foreach ($prop in @('jdk.jar.disabledAlgorithms', 'jdk.certpath.disabledAlgorithms')) {{
+        # Gesamten Property-Wert erfassen
+        $joined = [regex]::Replace($joined,
+            "(?m)(^$([regex]::Escape($prop))\s*=\s*)(.*)",
+            {{
+                param($m)
+                $prefix = $m.Groups[1].Value
+                $val    = $m.Groups[2].Value
+                # Alle SHA1-Token (mit beliebig vielen Qualifiern bis zum naechsten Komma) entfernen
+                $val = [regex]::Replace($val, ',?\s*SHA1(?:\s[^,]+)?', '')
+                $val = $val -replace '^\s*,\s*', ''   # fuehrendes Komma
+                $val = $val.Trim()
+                $changed = $true
+                "$prefix$val"
+            }})
+    }}
+
+    if ($changed) {{
+        [System.IO.File]::WriteAllText($Path, $joined, [System.Text.Encoding]::UTF8)
+    }}
+    return $changed
+}}
+
+# Per-user java.security override (kein Admin noetig, Java 8u171+)
+$userSecDir  = "$env:APPDATA\\Sun\\Java\\Deployment\\security"
+$userSecFile = "$userSecDir\\java.security"
+New-Item -ItemType Directory -Force -Path $userSecDir | Out-Null
+if (-not (Test-Path $userSecFile)) {{
+    # Minimale Override-Datei anlegen
+    $minContent = @"
+# Per-user java.security override (iKVM SHA1-Fix)
+jdk.jar.disabledAlgorithms=MD2, MD5, RSA keySize < 1024, DSA keySize < 1024
+jdk.certpath.disabledAlgorithms=MD2, MD5, DSA keySize < 1024, RSA keySize < 1024
+"@
+    [System.IO.File]::WriteAllText($userSecFile, $minContent, [System.Text.Encoding]::UTF8)
+    Write-Host "  [OK] Per-user java.security angelegt: $userSecFile" -ForegroundColor Green
+}} else {{
+    if (Remove-SHA1Restrictions $userSecFile) {{
+        Write-Host "  [OK] SHA1-Restrictions aus $userSecFile entfernt" -ForegroundColor Green
+    }} else {{
+        Write-Host "  [--] Per-user java.security bereits ohne SHA1-Einschraenkungen" -ForegroundColor Yellow
+    }}
+}}
+
+# Zusaetzlich: JRE-Systemdatei patchen (Admin erforderlich, aber effektiver)
+$javaHomes = @(
+    $env:JAVA_HOME,
+    ((Get-Command javaws -ErrorAction SilentlyContinue)?.Source | Split-Path -Parent | Split-Path -Parent)
+) + (Get-ChildItem 'C:\\Program Files\\Java','C:\\Program Files (x86)\\Java' -ErrorAction SilentlyContinue |
+     Select-Object -ExpandProperty FullName)
+
+$patched = $false
 foreach ($jh in ($javaHomes | Where-Object {{ $_ -and (Test-Path "$_\\lib\\security\\java.security") }})) {{
     $sec = "$jh\\lib\\security\\java.security"
-    Write-Host "  Patche: $sec"
+    Write-Host "  Versuche JRE-Datei: $sec"
     try {{
-        $content = Get-Content $sec -Raw -Encoding UTF8
-        # SHA1 aus jdk.jar.disabledAlgorithms entfernen
-        $patched = $content -replace 'SHA1 jdkCA[^,\\n]*,?\\s*', ''
-        $patched = $patched -replace ',\\s*$', ''
-        if ($patched -ne $content) {{
-            Copy-Item $sec "$sec.bak" -Force
-            [System.IO.File]::WriteAllText($sec, $patched, [System.Text.Encoding]::UTF8)
-            Write-Host "  [OK] SHA1-Einschraenkung entfernt (Backup: $sec.bak)" -ForegroundColor Green
+        Copy-Item $sec "$sec.bak" -Force -ErrorAction Stop
+        if (Remove-SHA1Restrictions $sec) {{
+            Write-Host "  [OK] SHA1-Einschraenkungen entfernt (Backup: $sec.bak)" -ForegroundColor Green
+            $patched = $true
         }} else {{
-            Write-Host "  [--] Keine SHA1-Einschraenkung gefunden" -ForegroundColor Yellow
+            Write-Host "  [--] Keine SHA1-Einschraenkungen gefunden" -ForegroundColor Yellow
         }}
+        break
     }} catch {{
-        Write-Host "  [!!] Admin-Rechte benoetigt fuer $sec - uebersprungen" -ForegroundColor Yellow
+        Write-Host "  [!!] Kein Schreibzugriff (Admin benoetigt) – per-user Override genuegt" -ForegroundColor Yellow
+        break
     }}
-    break
+}}
+if (-not $patched) {{
+    Write-Host "  [i] Nur per-user Override aktiv. Wenn Fehler bleibt: Skript als Admin ausfuehren." -ForegroundColor Cyan
 }}
 
 Write-Host ""
