@@ -4,7 +4,7 @@ FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
         ipmitool nmap curl \
-        xvfb x11vnc \
+        tigervnc-standalone-server \
         openjdk-17-jre \
         python3-websockify \
         procps \

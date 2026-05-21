@@ -170,9 +170,12 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
                 candidates.append(f"{base}{path}{sep}SID={sid}")
             for url in candidates:
                 try:
-                    r = sess.get(url, timeout=6, headers=hdrs)
-                    if '<jnlp' in r.text.lower():
+                    r = sess.get(url, timeout=3, headers=hdrs)
+                    ct = r.headers.get('Content-Type', '')
+                    if '<jnlp' in r.text.lower() or 'jnlp' in ct.lower():
                         return r
+                    if r.status_code == 404:
+                        break  # path doesn't exist; SID variant won't help either
                 except Exception:
                     continue
         return None
@@ -189,8 +192,8 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
 
     topmenu_url = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
     for url, timeout in [
-        (f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", 4),
-        (topmenu_url, 5),
+        (f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", 6),
+        (topmenu_url, 8),
     ]:
         try:
             sess.get(url, timeout=timeout)
@@ -201,22 +204,25 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
     sess.cookies.set('subpage',  'man_ikvm')
 
     try:
-        sess.get(jnlp_ref, timeout=8, headers={'Referer': topmenu_url})
+        sess.get(jnlp_ref, timeout=10, headers={'Referer': topmenu_url})
     except Exception:
         pass
 
-    try:
-        sess.post(
-            f"{base}/cgi/upgrade_process.cgi",
-            data='fwtype=255',
-            headers={
-                'Content-Type': 'application/x-www-form-urlencoded',
-                'Referer': jnlp_ref,
-            },
-            timeout=6,
-        )
-    except Exception:
-        pass
+    # Two polls mirror what the browser does before serving url_name=ikvm
+    poll_hdrs = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Referer': jnlp_ref,
+    }
+    for _ in range(2):
+        try:
+            sess.post(
+                f"{base}/cgi/upgrade_process.cgi",
+                data='fwtype=255',
+                headers=poll_hdrs,
+                timeout=8,
+            )
+        except Exception:
+            pass
 
     if progress_fn:
         progress_fn('Suche JNLP (nach Navigation)…')
@@ -313,29 +319,23 @@ def _do_run(sess: 'KvmSession', server: dict) -> None:
     def msg(text: str) -> None:
         sess.message = text
 
-    # ── 1. Xvfb ──────────────────────────────────────────────────────────────
-    msg('Starte Xvfb (virtuelles Display)…')
-    xvfb = subprocess.Popen(
-        ['Xvfb', disp, '-screen', '0', _RESOLUTION, '-ac', '+extension', 'GLX'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    sess.procs.append(xvfb)
-    time.sleep(0.8)
-    if xvfb.poll() is not None:
-        raise RuntimeError('Xvfb konnte nicht gestartet werden')
-
-    # ── 2. x11vnc ─────────────────────────────────────────────────────────────
-    msg('Starte VNC-Server (x11vnc)…')
+    # ── 1. TigerVNC (X-Server + VNC integriert, ersetzt Xvfb + x11vnc) ──────
+    msg('Starte TigerVNC (X + VNC)…')
     vnc = subprocess.Popen(
-        ['x11vnc', '-display', disp,
+        ['Xtigervnc', disp,
          '-rfbport', str(sess.port_vnc),
-         '-nopw', '-forever', '-shared', '-quiet', '-noxdamage', '-noipv6'],
+         '-SecurityTypes', 'None',
+         '-geometry', '1280x800',
+         '-depth', '24',
+         '-ac', '+extension', 'GLX'],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     sess.procs.append(vnc)
-    time.sleep(0.4)
+    time.sleep(1.5)
+    if vnc.poll() is not None:
+        raise RuntimeError('Xtigervnc konnte nicht gestartet werden')
 
-    # ── 3. websockify ─────────────────────────────────────────────────────────
+    # ── 2. websockify ─────────────────────────────────────────────────────────
     msg(f'Starte WebSocket-Proxy (Port {sess.port_ws})…')
     ws = subprocess.Popen(
         ['websockify', str(sess.port_ws), f'127.0.0.1:{sess.port_vnc}'],
