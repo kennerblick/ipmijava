@@ -554,7 +554,14 @@ function _kvmPoll(serverId) {
         clearInterval(_kvmPollTimer); _kvmPollTimer = null;
         _kvmError(r.error || 'Fehler beim Starten');
       }
-    } catch (_) { /* ignore poll errors */ }
+    } catch (e) {
+      // 404 = session was already removed (error occurred before we could poll)
+      if (e.message && e.message.includes('404')) {
+        clearInterval(_kvmPollTimer); _kvmPollTimer = null;
+        _kvmError('Session nicht mehr vorhanden — JNLP-Fehler? Debug: /api/servers/' + serverId + '/jnlp-debug');
+      }
+      // other errors (network hiccup): keep polling
+    }
   }, 1200);
 }
 

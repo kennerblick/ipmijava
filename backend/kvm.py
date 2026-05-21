@@ -224,9 +224,20 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
         except Exception:
             pass
 
-    if progress_fn:
-        progress_fn('Suche JNLP (nach Navigation)…')
-    return _try_paths(extra_header=True)
+    # Wait briefly — BMC iKVM service may take a moment to start after the polls
+    time.sleep(2)
+
+    # Retry scan up to 3 times; some BMCs need a few extra seconds
+    for attempt in range(1, 4):
+        if progress_fn:
+            progress_fn(f'Suche JNLP (Versuch {attempt}/3)…')
+        result = _try_paths(extra_header=True)
+        if result:
+            return result
+        if attempt < 3:
+            time.sleep(3)
+
+    return None
 
 
 # ── JNLP parser ───────────────────────────────────────────────────────────────
@@ -286,7 +297,7 @@ def get_session(session_id: str) -> Optional['KvmSession']:
 
 def get_session_for_server(server_id: str) -> Optional['KvmSession']:
     for s in _sessions.values():
-        if s.server_id == server_id and s.status in ('starting', 'running'):
+        if s.server_id == server_id and s.status in ('starting', 'running', 'error'):
             return s
     return None
 
@@ -308,7 +319,12 @@ def _run(sess: 'KvmSession', server: dict) -> None:
         sess.error   = str(e)
         sess.message = f'Fehler: {e}'
         _kill(sess)
-        _sessions.pop(sess.session_id, None)
+        # Keep in _sessions for 60 s so the frontend poll can read the error,
+        # then clean up. (Immediate pop causes silent 404 in the UI.)
+        def _deferred_remove():
+            time.sleep(60)
+            _sessions.pop(sess.session_id, None)
+        threading.Thread(target=_deferred_remove, daemon=True).start()
 
 
 def _do_run(sess: 'KvmSession', server: dict) -> None:
