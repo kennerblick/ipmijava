@@ -1,16 +1,14 @@
 FROM debian:bookworm-slim
 
-# System tools + X11 + VNC + Java (openjdk-17 with graphical support)
+# System tools + X11 + VNC + Java + websockify
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
         ipmitool nmap curl \
         xvfb x11vnc \
         openjdk-17-jre \
+        python3-websockify \
         procps \
     && rm -rf /var/lib/apt/lists/*
-
-# websockify via pip (provides the 'websockify' binary)
-RUN pip3 install --no-cache-dir websockify
 
 # Patch java.security in-container: remove SHA1 from disabled algorithm lists
 # so ATEN iKVM JARs (signed with SHA1withRSA) can run.
@@ -32,9 +30,9 @@ EOF
 
 WORKDIR /app
 
-# Python deps
+# Python deps (--break-system-packages needed on Debian Bookworm / PEP 668)
 COPY backend/requirements.txt .
-RUN pip3 install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # noVNC v1.4.0 static files (served by Flask at /novnc/)
 RUN curl -sL https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.tar.gz \
