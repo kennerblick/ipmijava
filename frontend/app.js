@@ -272,6 +272,7 @@ async function openConsole(serverId) {
     jnlpBtn.href   = data.jnlp_proxy;
     jnlpBtn.target = '_blank';
 
+    document.getElementById('console-java-fix-btn').href = data.java_fix;
     document.getElementById('console-bmc-btn').href = data.bmc_url;
 
     new bootstrap.Modal(document.getElementById('consoleModal')).show();

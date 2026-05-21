@@ -230,9 +230,132 @@ def api_console_url(server_id):
         return jsonify({'error': 'Nicht gefunden'}), 404
     return jsonify({
         'jnlp_proxy': f"/api/servers/{server_id}/jnlp",
-        'html5_url':  f"https://{server['ip']}/kvm.html",
+        'java_fix':   f"/api/servers/{server_id}/java-fix.ps1",
         'bmc_url':    f"https://{server['ip']}",
     })
+
+
+@app.route('/api/servers/<server_id>/java-fix.ps1', methods=['GET'])
+def api_java_fix(server_id):
+    """Return a PowerShell script that configures Java Web Start to trust this BMC.
+
+    ATEN iKVM JARs are signed with SHA1withRSA, which Java 8u211+ disables by
+    default.  The script configures the per-user Java deployment settings
+    (no admin rights required) and adds this BMC to the exception-site list.
+    """
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Nicht gefunden'}), 404
+
+    ip    = server['ip']
+    name  = server['name']
+    bmc   = f"https://{ip}"
+
+    script = f"""# Java Web Start – Sicherheitsfix für ATEN iKVM
+# Server: {name}  ({ip})
+# Einmalig ausführen; danach JNLP direkt starten.
+
+$ErrorActionPreference = 'Stop'
+
+$deployDir   = "$env:APPDATA\\Sun\\Java\\Deployment"
+$secDir      = "$deployDir\\security"
+$propsFile   = "$deployDir\\deployment.properties"
+$sitesFile   = "$secDir\\exception.sites"
+
+Write-Host "=== Java iKVM Sicherheitsfix ===" -ForegroundColor Cyan
+Write-Host "Konfiguriere Java fuer: {bmc}"
+
+# --- 1. Verzeichnisse erstellen -------------------------------------------------
+New-Item -ItemType Directory -Force -Path $secDir | Out-Null
+
+# --- 2. Exception-Site hinzufügen -----------------------------------------------
+$site = '{bmc}'
+if (Test-Path $sitesFile) {{
+    $existing = Get-Content $sitesFile -Raw
+}} else {{
+    $existing = ''
+}}
+if ($existing -notmatch [regex]::Escape($site)) {{
+    Add-Content -Path $sitesFile -Value $site -Encoding UTF8
+    Write-Host "  [OK] Exception-Site hinzugefuegt: $site" -ForegroundColor Green
+}} else {{
+    Write-Host "  [--] Exception-Site bereits vorhanden" -ForegroundColor Yellow
+}}
+
+# --- 3. deployment.properties aktualisieren ------------------------------------
+$needed = @{{
+    'deployment.security.level'                = 'MEDIUM'
+    'deployment.security.validation.crl'       = 'false'
+    'deployment.security.validation.ocsp'      = 'false'
+    'deployment.security.expired.warning'      = 'false'
+    'deployment.security.jsse.hostmismatch.warning' = 'false'
+    'deployment.manifest.attributes.check'    = 'false'
+}}
+
+if (Test-Path $propsFile) {{
+    $lines = [System.Collections.Generic.List[string]](Get-Content $propsFile -Encoding UTF8)
+}} else {{
+    $lines = [System.Collections.Generic.List[string]]::new()
+}}
+
+foreach ($key in $needed.Keys) {{
+    $val   = $needed[$key]
+    $found = $false
+    for ($i = 0; $i -lt $lines.Count; $i++) {{
+        if ($lines[$i] -match "^\\s*$([regex]::Escape($key))\\s*=") {{
+            $lines[$i] = "$key=$val"
+            $found = $true
+            break
+        }}
+    }}
+    if (-not $found) {{ $lines.Add("$key=$val") }}
+    Write-Host "  [OK] $key=$val" -ForegroundColor Green
+}}
+
+$lines | Set-Content $propsFile -Encoding UTF8
+
+# --- 4. Optional: SHA1 in java.security entsperren -----------------------------
+#  (erfordert Admin-Rechte; wird uebersprungen wenn keine Rechte vorhanden)
+$javaHomes = @(
+    "$env:JAVA_HOME",
+    (Get-Command javaws -ErrorAction SilentlyContinue)?.Source | Split-Path | Split-Path
+) + (Get-ChildItem 'C:\\Program Files\\Java' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+
+foreach ($jh in ($javaHomes | Where-Object {{ $_ -and (Test-Path "$_\\lib\\security\\java.security") }})) {{
+    $sec = "$jh\\lib\\security\\java.security"
+    Write-Host "  Patche: $sec"
+    try {{
+        $content = Get-Content $sec -Raw -Encoding UTF8
+        # SHA1 aus jdk.jar.disabledAlgorithms entfernen
+        $patched = $content -replace 'SHA1 jdkCA[^,\\n]*,?\\s*', ''
+        $patched = $patched -replace ',\\s*$', ''
+        if ($patched -ne $content) {{
+            Copy-Item $sec "$sec.bak" -Force
+            [System.IO.File]::WriteAllText($sec, $patched, [System.Text.Encoding]::UTF8)
+            Write-Host "  [OK] SHA1-Einschraenkung entfernt (Backup: $sec.bak)" -ForegroundColor Green
+        }} else {{
+            Write-Host "  [--] Keine SHA1-Einschraenkung gefunden" -ForegroundColor Yellow
+        }}
+    }} catch {{
+        Write-Host "  [!!] Admin-Rechte benoetigt fuer $sec - uebersprungen" -ForegroundColor Yellow
+    }}
+    break
+}}
+
+Write-Host ""
+Write-Host "Fertig! Bitte JNLP-Datei erneut starten." -ForegroundColor Green
+Write-Host "Druecke eine Taste zum Beenden..."
+$null = $host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown')
+"""
+
+    return Response(
+        script,
+        content_type='text/plain; charset=utf-8',
+        headers={
+            'Content-Disposition': f'attachment; filename="java-fix-{re.sub(r"[^a-zA-Z0-9]", "_", ip)}.ps1"',
+        },
+    )
 
 
 # ── BMC session helpers ───────────────────────────────────────────────────────
