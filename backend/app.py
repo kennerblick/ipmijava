@@ -268,38 +268,52 @@ _MENU_NAMES = frozenset({
 })
 
 
+# Mimic a real browser so ATEN's web server doesn't reject python-requests UA
+_BROWSER_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.5',
+}
+
+
 def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session, str | None]:
     """Authenticate against the BMC and return (session, sid_or_None).
 
     Handles two BMC generations:
     - Legacy ATEN (X8/X9): login.cgi returns 200 with SID embedded in JavaScript
     - AMI MegaRAC (X10/X11/X12+): login.cgi sets SID as an HTTP cookie
+
+    After login, simulates browser navigation (mainmenu → topmenu) so that
+    ATEN's session-state checks pass when the JNLP URL is later requested.
     """
     sess = req_lib.Session()
     sess.verify = False
+    sess.headers.update(_BROWSER_HEADERS)
 
     try:
         r = sess.post(
             f"{base}/cgi/login.cgi",
             data={'name': username, 'pwd': password},
             timeout=10,
-            allow_redirects=False,   # keep=False so we see the raw Set-Cookie on the 302
+            allow_redirects=False,
         )
     except Exception:
         return sess, None
 
-    # AMI path: cookie already on the 302 response
+    # AMI path: cookie on the 302 response
     sid = _pick_sid(r.cookies) or _pick_sid(sess.cookies)
 
     if not sid:
-        # Follow the redirect manually so the session accumulates cookies
         loc = r.headers.get('Location', '')
         if loc and r.status_code in (301, 302, 303, 307, 308):
             target = loc if loc.startswith('http') else f"{base}{loc}"
             try:
                 r2 = sess.get(target, timeout=10, allow_redirects=True)
                 sid = _pick_sid(sess.cookies) or _pick_sid(r2.cookies)
-                # ATEN path: SID may be embedded in the JS of the redirected page
                 if not sid:
                     sid = _extract_sid_from_body(r2.text)
             except Exception:
@@ -312,7 +326,52 @@ def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session
     if sid:
         sess.cookies.set('SID', sid)
 
+    # Simulate browser navigation: ATEN's url_redirect.cgi?url_name=ikvm
+    # checks internal session state that is only set after visiting topmenu.
+    # Also sets mainpage/subpage cookies needed for the KVM section.
+    _bmc_navigate_to_kvm(sess, base)
+
     return sess, sid
+
+
+def _bmc_navigate_to_kvm(sess: req_lib.Session, base: str) -> None:
+    """Visit mainmenu and topmenu, then set the navigation cookies that ATEN uses
+    to gate the JNLP endpoint. Extract cookie names/values from topmenu JS."""
+    try:
+        sess.get(f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", timeout=5)
+    except Exception:
+        pass
+
+    topmenu_text = ''
+    try:
+        r = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=topmenu", timeout=10)
+        topmenu_text = r.text
+    except Exception:
+        pass
+
+    if not topmenu_text:
+        return
+
+    # Find SetCookie calls near KVM/IKVM/remote keywords (±400 chars context)
+    for m in re.finditer(r'(?:ikvm|kvm|remote|iview|console)', topmenu_text, re.I):
+        start = max(0, m.start() - 400)
+        end   = min(len(topmenu_text), m.end() + 400)
+        chunk = topmenu_text[start:end]
+        for name, val in re.findall(
+            r'SetCookie\s*\(\s*["\'](\w+)["\'],\s*["\']([^"\']+)["\']', chunk
+        ):
+            sess.cookies.set(name, val)
+
+    # Fallback: try common ATEN navigation cookie patterns for the KVM section
+    # These values appear in ATEN firmware source for the remote control menu
+    for pattern in [
+        r'c_mainpage\s*=\s*["\']([^"\']+)["\'].*?(?:ikvm|kvm|remote)',
+        r'(?:ikvm|kvm|remote).*?c_mainpage\s*=\s*["\']([^"\']+)["\']',
+    ]:
+        m = re.search(pattern, topmenu_text, re.I | re.S)
+        if m:
+            sess.cookies.set('mainpage', m.group(1))
+            break
 
 
 def _pick_sid(cookies) -> str | None:
@@ -338,7 +397,10 @@ def _extract_sid_from_body(text: str) -> str | None:
 
 
 def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Response | None:
-    """Try all known JNLP paths, then scrape mainmenu for unknown firmware variants."""
+    """Try all known JNLP paths, then scrape navigation pages for firmware-specific URLs."""
+    # Referer mimics the browser being on the topmenu/navigation page
+    jnlp_headers = {'Referer': f"{base}/cgi/url_redirect.cgi?url_name=topmenu"}
+
     candidates = []
     for path in _JNLP_PATHS:
         candidates.append(f"{base}{path}")
@@ -348,13 +410,13 @@ def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Re
 
     for url in candidates:
         try:
-            r = sess.get(url, timeout=8)
+            r = sess.get(url, timeout=8, headers=jnlp_headers)
             if '<jnlp' in r.text.lower():
                 return r
         except Exception:
             continue
 
-    # Static paths exhausted — scrape mainmenu for firmware-specific KVM links
+    # Static paths exhausted — scrape navigation pages for firmware-specific KVM links
     return _fetch_jnlp_from_mainmenu(sess, base, sid)
 
 
@@ -535,10 +597,10 @@ def api_jnlp_debug(server_id):
             except Exception as e:
                 steps.append({'step': 'jnlp_try', 'url': url, 'error': str(e)})
 
-    # Step 3+: scan navigation pages — show full body for topmenu to find KVM link
+    # Step 3+: scan navigation pages
     for label, url_name, body_limit in [
         ('3_mainmenu',       'mainmenu',       800),
-        ('4_topmenu',        'topmenu',        3000),   # full topmenu — JS contains launch URL
+        ('4_topmenu',        'topmenu',        8000),   # need full JS to find KVM cookie values
         ('5_remote_control', 'remote_control', 2000),
         ('6_remote_ctrl',    'remote_ctrl',    2000),
     ]:
@@ -560,6 +622,32 @@ def api_jnlp_debug(server_id):
             })
         except Exception as e:
             steps.append({'step': label, 'error': str(e)})
+
+    # Step 6b: extract KVM navigation cookies from full topmenu body
+    try:
+        topmenu_full = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=topmenu", timeout=10)
+        txt = topmenu_full.text
+        # Find SetCookie calls within ±600 chars of KVM/IKVM/remote keywords
+        kvm_cookies_found = []
+        for m in re.finditer(r'(?:ikvm|kvm|remote|iview|console)', txt, re.I):
+            chunk = txt[max(0, m.start()-600):min(len(txt), m.end()+600)]
+            for n, v in re.findall(r'SetCookie\s*\(\s*["\'](\w+)["\'],\s*["\']([^"\']+)["\']', chunk):
+                kvm_cookies_found.append(f'{n}={v}')
+        # Find c_mainpage/c_subpage assignments near KVM
+        mainpage_vals = re.findall(r'c_mainpage\s*[=,]\s*["\']([^"\']+)["\']', txt)
+        subpage_vals  = re.findall(r'c_subpage\s*[=,]\s*["\']([^"\']+)["\']', txt)
+        # Full SetCookie list
+        all_setcookies = re.findall(r'SetCookie\s*\(\s*["\'](\w+)["\'],\s*["\']([^"\']+)["\']', txt)
+        steps.append({
+            'step': '6b_topmenu_kvm_cookies',
+            'kvm_cookies_near_kvm_keyword': list(set(kvm_cookies_found)),
+            'all_c_mainpage_values': list(set(mainpage_vals)),
+            'all_c_subpage_values':  list(set(subpage_vals)),
+            'all_setcookie_calls':   str(list(set(all_setcookies))[:30]),
+            'current_session_cookies': dict(sess.cookies),
+        })
+    except Exception as e:
+        steps.append({'step': '6b_topmenu_kvm_cookies', 'error': str(e)})
 
     # Step 7: fetch JS utility file — often contains the iKVM launch URL
     for js_path in ['/js/utils.js', '/js/util.js', '/js/ikvm.js', '/js/kvm.js']:
