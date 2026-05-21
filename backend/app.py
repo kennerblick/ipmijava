@@ -337,15 +337,19 @@ def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session
 def _bmc_navigate_to_kvm(sess: req_lib.Session, base: str) -> None:
     """Simulate the browser navigation path to the iKVM console page.
 
-    From topmenu JS analysis:
-      page_mapping('remote', 'man_ikvm')  →  sets cookies + loads man_ikvm frame
-
-    This sets the ATEN navigation cookies and visits the man_ikvm content page,
-    which likely initialises the iKVM service on the BMC side before the JNLP
-    URL becomes accessible.
+    Full browser flow (from man_ikvm page source analysis):
+      1. mainmenu  → erases navigation cookies, loads topmenu frame
+      2. topmenu   → renders navigation bar
+      3. Set mainpage/subpage cookies (what page_mapping('remote','man_ikvm') does)
+      4. man_ikvm  → Console Redirection page; onload calls pollServer()
+      5. POST upgrade_process.cgi fwtype=255  → pollServer() — checks iKVM service
+         available; only after this POST does url_name=ikvm return the JNLP.
+      6. POST upgrade_process.cgi fwtype=255 again — browser does a second poll
+         on button click before actually navigating to the JNLP URL.
     """
-    topmenu_ref = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
+    topmenu_ref  = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
     man_ikvm_url = f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"
+    poll_url     = f"{base}/cgi/upgrade_process.cgi"
 
     try:
         sess.get(f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", timeout=5)
@@ -360,14 +364,23 @@ def _bmc_navigate_to_kvm(sess: req_lib.Session, base: str) -> None:
     sess.cookies.set('mainpage', 'remote')
     sess.cookies.set('subpage',  'man_ikvm')
 
-    # Visit the Console Redirection content page.
-    # This page calls GetIKVMStatus() via AJAX which starts the iKVM service —
-    # only after this does url_redirect.cgi?url_name=ikvm become accessible.
     try:
-        sess.get(man_ikvm_url, timeout=10,
-                 headers={'Referer': topmenu_ref})
+        sess.get(man_ikvm_url, timeout=10, headers={'Referer': topmenu_ref})
     except Exception:
         pass
+
+    # Mirror the two pollServer() calls the browser makes.
+    # POST fwtype=255 to upgrade_process.cgi checks/starts the iKVM service.
+    # The BMC only serves url_name=ikvm after at least one successful poll.
+    poll_headers = {
+        'Referer':      man_ikvm_url,
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    for _ in range(2):
+        try:
+            sess.post(poll_url, data='fwtype=255', headers=poll_headers, timeout=8)
+        except Exception:
+            pass
 
 
 def _pick_sid(cookies) -> str | None:
@@ -621,6 +634,44 @@ def api_jnlp_debug(server_id):
         except Exception as e:
             steps.append({'step': label, 'error': str(e)})
 
+    # Step 5b: POST upgrade_process.cgi fwtype=255 — mirrors browser's pollServer()
+    # man_ikvm page calls this before serving the JNLP URL
+    try:
+        pg = sess.post(
+            f"{base}/cgi/upgrade_process.cgi",
+            data='fwtype=255',
+            headers={
+                'Referer':      f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+            timeout=8,
+        )
+        steps.append({
+            'step': '5b_upgrade_process_poll',
+            'status': pg.status_code,
+            'body_length': len(pg.content),
+            'body_preview': pg.text[:800],
+        })
+    except Exception as e:
+        steps.append({'step': '5b_upgrade_process_poll', 'error': str(e)})
+
+    # Step 5c: fetch url_name=ikvm AFTER the poll (this is what the browser does)
+    try:
+        jnlp_url = f"{base}/cgi/url_redirect.cgi?url_name=ikvm"
+        pg = sess.get(jnlp_url, timeout=8,
+                      headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"})
+        steps.append({
+            'step': '5c_ikvm_after_poll',
+            'url': jnlp_url,
+            'status': pg.status_code,
+            'content_type': pg.headers.get('Content-Type', ''),
+            'body_length': len(pg.content),
+            'is_jnlp': '<jnlp' in pg.text.lower(),
+            'body_preview': pg.text[:800],
+        })
+    except Exception as e:
+        steps.append({'step': '5c_ikvm_after_poll', 'error': str(e)})
+
     # Step 6b: extract KVM navigation cookies from full topmenu body
     try:
         topmenu_full = sess.get(f"{base}/cgi/url_redirect.cgi?url_name=topmenu", timeout=10)
@@ -654,12 +705,21 @@ def api_jnlp_debug(server_id):
             if r.status_code == 200 and len(r.text) > 50:
                 # Extract any .jnlp or cgi references from the JS
                 jnlp_refs = re.findall(r'["\']([^"\']*(?:jnlp|ikvm|launch|kvm)[^"\']*)["\']', r.text, re.I)
+                # Find IKVM_SERVICE definition specifically
+                ikvm_svc_m = re.search(r'IKVM_SERVICE\s*=\s*["\']([^"\']+)["\']', r.text)
+                # Also show the 500 chars around IKVM_SERVICE definition
+                ikvm_svc_ctx = ''
+                m2 = re.search(r'IKVM_SERVICE', r.text)
+                if m2:
+                    ikvm_svc_ctx = r.text[max(0, m2.start()-100):min(len(r.text), m2.end()+400)]
                 steps.append({
                     'step': f'8_js_{js_path.split("/")[-1]}',
                     'url': js_path,
                     'status': r.status_code,
                     'body_length': len(r.content),
                     'jnlp_kvm_refs': str(jnlp_refs[:20]),
+                    'IKVM_SERVICE_value': ikvm_svc_m.group(1) if ikvm_svc_m else 'not found as string literal',
+                    'IKVM_SERVICE_context': ikvm_svc_ctx,
                     'body_preview': r.text[:2000],
                 })
         except Exception:
