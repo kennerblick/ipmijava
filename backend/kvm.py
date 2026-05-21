@@ -174,8 +174,11 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
                     ct = r.headers.get('Content-Type', '')
                     if '<jnlp' in r.text.lower() or 'jnlp' in ct.lower():
                         return r
-                    if r.status_code == 404:
-                        break  # path doesn't exist; SID variant won't help either
+                    # Only skip SID variant for static file paths (not CGI).
+                    # CGI paths return 404 on auth failure, not missing file,
+                    # so the SID variant may still succeed.
+                    if r.status_code == 404 and '/cgi/' not in path:
+                        break
                 except Exception:
                     continue
         return None
@@ -243,13 +246,36 @@ def _fetch_jnlp(sess, base: str, sid: Optional[str], progress_fn=None) -> Option
 # ── JNLP parser ───────────────────────────────────────────────────────────────
 
 def _parse_jnlp(text: str, base: str) -> tuple:
-    """Return (jar_urls, nativelib_urls, main_class, arguments)."""
+    """Return (jar_urls, nativelib_urls, main_class, arguments).
+
+    Handles mixed HTML+JNLP responses: some ATEN BMCs return the man_ikvm HTML
+    page with the JNLP XML appended after </html>.  We extract just the JNLP
+    portion before passing it to ElementTree.
+
+    Only includes nativelib entries for Linux x86_64 (the container OS).
+    """
+    lo = text.lower()
+    start = lo.find('<jnlp')
+    end   = lo.rfind('</jnlp>')
+    if start != -1:
+        text = text[start : end + 7] if end != -1 else text[start:]
+
     text = text.replace(' xmlns=', ' _xmlns=')
     root = ET.fromstring(text)
     codebase = root.get('codebase', base).rstrip('/')
 
     jars, native_jars = [], []
     for res in root.iter('resources'):
+        res_os   = (res.get('os',   '') or '').lower()
+        res_arch = (res.get('arch', '') or '').lower()
+
+        # Skip OS-specific blocks that don't match the Linux container
+        if res_os:
+            if 'linux' not in res_os:
+                continue                                    # Windows / Mac
+            if res_arch and res_arch not in ('x86_64', 'amd64'):
+                continue                                    # 32-bit Linux
+
         for el in res:
             href = el.get('href', '').strip()
             if not href:
