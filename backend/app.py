@@ -806,22 +806,34 @@ def api_jnlp_debug(server_id):
     except Exception as e:
         steps.append({'step': '5b_upgrade_process_poll', 'error': str(e)})
 
-    # Step 5c: fetch url_name=ikvm AFTER the poll (this is what the browser does)
-    try:
-        jnlp_url = f"{base}/cgi/url_redirect.cgi?url_name=ikvm"
-        pg = sess.get(jnlp_url, timeout=8,
-                      headers={'Referer': f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"})
-        steps.append({
-            'step': '5c_ikvm_after_poll',
-            'url': jnlp_url,
-            'status': pg.status_code,
-            'content_type': pg.headers.get('Content-Type', ''),
-            'body_length': len(pg.content),
-            'is_jnlp': '<jnlp' in pg.text.lower(),
-            'body_preview': pg.text[:800],
-        })
-    except Exception as e:
-        steps.append({'step': '5c_ikvm_after_poll', 'error': str(e)})
+    # Step 5c: set navigation cookies (as JS page_mapping would), then re-fetch
+    # man_ikvm — hypothesis: firmware appends JNLP to man_ikvm response after poll
+    man_ikvm_url   = f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"
+    topmenu_url_d  = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
+    sess.cookies.set('mainpage', 'remote')
+    sess.cookies.set('subpage',  'man_ikvm')
+    for step_label, url, extra_sid in [
+        ('5c_man_ikvm_after_poll',         man_ikvm_url,                  False),
+        ('5c2_man_ikvm_after_poll_sid',    man_ikvm_url,                  True),
+        ('5c3_ikvm_after_poll',            f"{base}/cgi/url_redirect.cgi?url_name=ikvm", False),
+        ('5c4_ikvm_after_poll_sid',        f"{base}/cgi/url_redirect.cgi?url_name=ikvm", True),
+    ]:
+        _sid = _pick_sid(sess.cookies)
+        _url = url + (f'&SID={_sid}' if extra_sid and _sid else '')
+        try:
+            pg = sess.get(_url, timeout=8,
+                          headers={'Referer': topmenu_url_d})
+            steps.append({
+                'step': step_label,
+                'url': _url,
+                'status': pg.status_code,
+                'content_type': pg.headers.get('Content-Type', ''),
+                'body_length': len(pg.content),
+                'is_jnlp': '<jnlp' in pg.text.lower(),
+                'body_preview': pg.text[:1200],
+            })
+        except Exception as e:
+            steps.append({'step': step_label, 'error': str(e)})
 
     # Step 6b: extract KVM navigation cookies from full topmenu body
     try:

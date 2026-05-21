@@ -43,6 +43,10 @@ _BROWSER_UA = (
 
 # JNLP URL candidates — tried in order, most common first
 _JNLP_PATHS = [
+    # Some ATEN/Supermicro firmware appends JNLP XML to the man_ikvm page
+    # response AFTER the iKVM service poll confirms readiness.  Try it first
+    # in pass 2 (extra_header=True, Referer=man_ikvm, mainpage/subpage cookies set).
+    '/cgi/url_redirect.cgi?url_name=man_ikvm',
     '/cgi/url_redirect.cgi?url_name=ikvm',
     '/cgi/url_redirect.cgi?url_name=launch',
     '/cgi/url_redirect.cgi?url_name=java_iview',
