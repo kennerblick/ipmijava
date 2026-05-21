@@ -359,12 +359,10 @@ $userSecDir  = "$env:APPDATA\\Sun\\Java\\Deployment\\security"
 $userSecFile = "$userSecDir\\java.security"
 New-Item -ItemType Directory -Force -Path $userSecDir | Out-Null
 if (-not (Test-Path $userSecFile)) {{
-    # Minimale Override-Datei anlegen
-    $minContent = @"
-# Per-user java.security override (iKVM SHA1-Fix)
-jdk.jar.disabledAlgorithms=MD2, MD5, RSA keySize < 1024, DSA keySize < 1024
-jdk.certpath.disabledAlgorithms=MD2, MD5, DSA keySize < 1024, RSA keySize < 1024
-"@
+    # Minimale Override-Datei anlegen (kein Here-String, damit PS5.1 kompatibel)
+    $minContent = "# Per-user java.security override (iKVM SHA1-Fix)`r`n" +
+                  "jdk.jar.disabledAlgorithms=MD2, MD5, RSA keySize < 1024, DSA keySize < 1024`r`n" +
+                  "jdk.certpath.disabledAlgorithms=MD2, MD5, DSA keySize < 1024, RSA keySize < 1024`r`n"
     [System.IO.File]::WriteAllText($userSecFile, $minContent, [System.Text.Encoding]::UTF8)
     Write-Host "  [OK] Per-user java.security angelegt: $userSecFile" -ForegroundColor Green
 }} else {{
@@ -378,7 +376,7 @@ jdk.certpath.disabledAlgorithms=MD2, MD5, DSA keySize < 1024, RSA keySize < 1024
 # Zusaetzlich: JRE-Systemdatei patchen (Admin erforderlich, aber effektiver)
 $javaHomes = @(
     $env:JAVA_HOME,
-    ((Get-Command javaws -ErrorAction SilentlyContinue)?.Source | Split-Path -Parent | Split-Path -Parent)
+    $(if ($c = Get-Command javaws -ErrorAction SilentlyContinue) {{ Split-Path -Parent (Split-Path -Parent $c.Source) }})
 ) + (Get-ChildItem 'C:\\Program Files\\Java','C:\\Program Files (x86)\\Java' -ErrorAction SilentlyContinue |
      Select-Object -ExpandProperty FullName)
 
