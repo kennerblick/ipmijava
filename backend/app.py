@@ -239,12 +239,22 @@ def api_console_url(server_id):
 
 # Static JNLP URL candidates (tried in order before mainmenu scraping)
 _JNLP_PATHS = [
+    # url_redirect.cgi variants
     '/cgi/url_redirect.cgi?url_name=ikvm',
+    '/cgi/url_redirect.cgi?url_name=launch',       # matches downloaded filename "launch.jnlp"
     '/cgi/url_redirect.cgi?url_name=java_iview',
     '/cgi/url_redirect.cgi?url_name=iview',
     '/cgi/url_redirect.cgi?url_name=kvm',
     '/cgi/url_redirect.cgi?url_name=kvmjnlp',
+    # Direct CGI endpoints seen in ATEN firmware
+    '/cgi/CGI_GetJNLPContent.cgi',                 # ATEN firmware API
+    '/cgi/getJNLP.cgi',
     '/cgi/ikvm.cgi',
+    '/cgi/ikvm',
+    '/cgi/launchKVM.cgi',
+    # Root-level JNLP (codebase in JNLP is root "/", file named "launch.jnlp")
+    '/launch.jnlp',
+    '/iKVM.jnlp',
     '/iKVM/iKVM.jnlp',
     '/iview.jnlp',
     '/kvm.jnlp',
@@ -525,16 +535,19 @@ def api_jnlp_debug(server_id):
             except Exception as e:
                 steps.append({'step': 'jnlp_try', 'url': url, 'error': str(e)})
 
-    # Step 3+: scan all navigation pages and show url_name values + body
-    for label, url_name in [
-        ('3_mainmenu', 'mainmenu'),
-        ('4_topmenu',  'topmenu'),
-        ('5_remote_control', 'remote_control'),
+    # Step 3+: scan navigation pages — show full body for topmenu to find KVM link
+    for label, url_name, body_limit in [
+        ('3_mainmenu',       'mainmenu',       800),
+        ('4_topmenu',        'topmenu',        3000),   # full topmenu — JS contains launch URL
+        ('5_remote_control', 'remote_control', 2000),
+        ('6_remote_ctrl',    'remote_ctrl',    2000),
     ]:
         try:
             pg = sess.get(f"{base}/cgi/url_redirect.cgi?url_name={url_name}", timeout=10)
             names = sorted({m.group(1) for m in re.finditer(r'url_name=([a-zA-Z_0-9]+)', pg.text)})
-            jnlp_h = re.findall(r'(?:href|src)=["\']([^"\']+\.jnlp[^"\']*)["\']', pg.text, re.I)
+            jnlp_h = re.findall(r'(?:href|src|open|location)[^"\']*["\']([^"\']*\.jnlp[^"\']*)["\']', pg.text, re.I)
+            # Also extract window.open() and href calls that might contain the KVM URL
+            js_opens = re.findall(r'(?:window\.open|location\.href|location\s*=)\s*\(\s*["\']([^"\']+)["\']', pg.text, re.I)
             steps.append({
                 'step': label,
                 'url': f"/cgi/url_redirect.cgi?url_name={url_name}",
@@ -542,10 +555,29 @@ def api_jnlp_debug(server_id):
                 'body_length': len(pg.content),
                 'url_names_found': str(names),
                 'jnlp_hrefs_found': str(jnlp_h),
-                'body_preview': pg.text[:1200],
+                'js_opens': str(js_opens),
+                'body_preview': pg.text[:body_limit],
             })
         except Exception as e:
             steps.append({'step': label, 'error': str(e)})
+
+    # Step 7: fetch JS utility file — often contains the iKVM launch URL
+    for js_path in ['/js/utils.js', '/js/util.js', '/js/ikvm.js', '/js/kvm.js']:
+        try:
+            r = sess.get(f"{base}{js_path}", timeout=8)
+            if r.status_code == 200 and len(r.text) > 50:
+                # Extract any .jnlp or cgi references from the JS
+                jnlp_refs = re.findall(r'["\']([^"\']*(?:jnlp|ikvm|launch|kvm)[^"\']*)["\']', r.text, re.I)
+                steps.append({
+                    'step': f'7_js_{js_path.split("/")[-1]}',
+                    'url': js_path,
+                    'status': r.status_code,
+                    'body_length': len(r.content),
+                    'jnlp_kvm_refs': str(jnlp_refs[:20]),
+                    'body_preview': r.text[:2000],
+                })
+        except Exception:
+            pass
 
     result = {
         'server_ip': server['ip'],
