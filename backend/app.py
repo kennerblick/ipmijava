@@ -235,13 +235,111 @@ def api_console_url(server_id):
     })
 
 
+# ── BMC session helpers ───────────────────────────────────────────────────────
+
+# JNLP URL candidates to try in order
+_JNLP_PATHS = [
+    '/cgi/url_redirect.cgi?url_name=ikvm',
+    '/cgi/ikvm.cgi',
+]
+
+
+def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session, str | None]:
+    """Authenticate against the BMC and return (session, sid_or_None).
+
+    Handles two BMC generations:
+    - Legacy ATEN (X8/X9): login.cgi returns 200 with SID embedded in JavaScript
+    - AMI MegaRAC (X10/X11/X12+): login.cgi sets SID as an HTTP cookie
+    """
+    sess = req_lib.Session()
+    sess.verify = False
+
+    try:
+        r = sess.post(
+            f"{base}/cgi/login.cgi",
+            data={'name': username, 'pwd': password},
+            timeout=10,
+            allow_redirects=False,   # keep=False so we see the raw Set-Cookie on the 302
+        )
+    except Exception:
+        return sess, None
+
+    # AMI path: cookie already on the 302 response
+    sid = _pick_sid(r.cookies) or _pick_sid(sess.cookies)
+
+    if not sid:
+        # Follow the redirect manually so the session accumulates cookies
+        loc = r.headers.get('Location', '')
+        if loc and r.status_code in (301, 302, 303, 307, 308):
+            target = loc if loc.startswith('http') else f"{base}{loc}"
+            try:
+                r2 = sess.get(target, timeout=10, allow_redirects=True)
+                sid = _pick_sid(sess.cookies) or _pick_sid(r2.cookies)
+                # ATEN path: SID may be embedded in the JS of the redirected page
+                if not sid:
+                    sid = _extract_sid_from_body(r2.text)
+            except Exception:
+                pass
+
+    # ATEN path on 200: SID in the JS body of login.cgi itself
+    if not sid and r.status_code == 200:
+        sid = _extract_sid_from_body(r.text)
+
+    if sid:
+        sess.cookies.set('SID', sid)
+
+    return sess, sid
+
+
+def _pick_sid(cookies) -> str | None:
+    for name in ('SID', 'sid', 'QSESSIONID'):
+        v = cookies.get(name)
+        if v:
+            return v
+    return None
+
+
+def _extract_sid_from_body(text: str) -> str | None:
+    """Extract SID from JavaScript responses (legacy ATEN BMC)."""
+    patterns = [
+        r'[?&]SID=([a-fA-F0-9]+)',                        # URL parameter
+        r'[Ss][Ii][Dd]\s*[=:]\s*[\'"]([a-fA-F0-9]{8,})', # var SID = '...'
+        r'SID[,\s]*([a-fA-F0-9]{16,})',                   # bare assignment
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Response | None:
+    """Try all known JNLP paths, with and without SID query param."""
+    candidates = []
+    for path in _JNLP_PATHS:
+        candidates.append(f"{base}{path}")
+        if sid:
+            sep = '&' if '?' in path else '?'
+            candidates.append(f"{base}{path}{sep}SID={sid}")
+
+    for url in candidates:
+        try:
+            r = sess.get(url, timeout=10)
+            if '<jnlp' in r.text.lower():
+                return r
+        except Exception:
+            continue
+    return None
+
+
+# ── Console endpoints ─────────────────────────────────────────────────────────
+
 @app.route('/api/servers/<server_id>/jnlp', methods=['GET'])
 def api_console_jnlp(server_id):
-    """Log in to the BMC, fetch the iKVM JNLP, and proxy it back to the browser.
+    """Log in to the BMC, fetch iKVM JNLP, proxy it to the browser.
 
-    This solves the 'session timed out' error: the browser never touches the BMC
-    directly for the JNLP download — our backend authenticates and delivers the file.
-    Java Web Start then connects directly from the client to the BMC for the KVM stream.
+    Handles both ATEN (SID in JS body) and AMI (SID as HTTP cookie) BMC firmware.
+    Java Web Start then connects directly from the client to the BMC.
     """
     config = load_config()
     server, _ = find_server(config, server_id)
@@ -249,42 +347,19 @@ def api_console_jnlp(server_id):
         return jsonify({'error': 'Server nicht gefunden'}), 404
 
     base = f"https://{server['ip']}"
-    sess = req_lib.Session()
-    sess.verify = False  # BMCs use self-signed certificates
-
     try:
-        # Step 1: authenticate
-        login = sess.post(
-            f"{base}/cgi/login.cgi",
-            data={'name': server['username'], 'pwd': server['password']},
-            timeout=10,
-            allow_redirects=True,
-        )
-        # Detect login failure (BMC returns HTML with error text, not HTTP 4xx)
-        if any(phrase in login.text.lower() for phrase in ('invalid', 'fail', 'error', 'incorrect')):
-            return _jnlp_error(server['ip'], 'Login fehlgeschlagen – Benutzername/Passwort prüfen.')
+        sess, sid = _bmc_login(base, server['username'], server['password'])
+        jnlp_resp = _fetch_jnlp(sess, base, sid)
 
-        # Step 2: fetch JNLP (session cookie is now set in sess)
-        jnlp_resp = sess.get(
-            f"{base}/cgi/url_redirect.cgi?url_name=ikvm",
-            timeout=10,
-        )
-
-        content = jnlp_resp.text
-        # Detect session-expired response instead of JNLP XML
-        if 'timed out' in content.lower() or ('<jnlp' not in content.lower() and len(content) < 2000):
-            # Fallback: try SID via URL parameter (supported on some firmware versions)
-            sid = sess.cookies.get('SID') or sess.cookies.get('sid')
-            if sid:
-                jnlp_resp = sess.get(
-                    f"{base}/cgi/url_redirect.cgi?url_name=ikvm&SID={sid}",
-                    timeout=10,
-                )
-                content = jnlp_resp.text
-
-        if '<jnlp' not in content.lower():
-            return _jnlp_error(server['ip'], 'BMC lieferte keine JNLP-Datei. '
-                               'Möglicherweise ist kein Java iKVM verfügbar (nur HTML5 KVM?).')
+        if jnlp_resp is None:
+            debug_url = f"/api/servers/{server_id}/jnlp-debug"
+            return _jnlp_error(
+                server['ip'],
+                'BMC lieferte keine JNLP-Datei.<br>'
+                'Mögliche Ursachen: falsches Passwort, nur HTML5-KVM verfügbar, '
+                'oder abweichende Firmware-Version.',
+                debug_url,
+            )
 
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', server['name'])
         return Response(
@@ -297,7 +372,7 @@ def api_console_jnlp(server_id):
         )
 
     except req_lib.exceptions.SSLError:
-        return _jnlp_error(server['ip'], 'SSL-Fehler beim Verbinden mit BMC (selbstsigniertes Zertifikat).')
+        return _jnlp_error(server['ip'], 'SSL-Fehler (selbstsigniertes Zertifikat).')
     except req_lib.exceptions.ConnectionError:
         return _jnlp_error(server['ip'], f'BMC nicht erreichbar: {server["ip"]}')
     except req_lib.exceptions.Timeout:
@@ -306,13 +381,118 @@ def api_console_jnlp(server_id):
         return _jnlp_error(server['ip'], str(e))
 
 
-def _jnlp_error(ip: str, message: str) -> Response:
+@app.route('/api/servers/<server_id>/jnlp-debug', methods=['GET'])
+def api_jnlp_debug(server_id):
+    """Diagnostic endpoint — shows exactly what the BMC returns during login + JNLP fetch."""
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Server nicht gefunden'}), 404
+
+    base = f"https://{server['ip']}"
+    steps = []
+
+    sess = req_lib.Session()
+    sess.verify = False
+
+    # Step 1: raw login POST (allow_redirects=False to see 302 details)
+    try:
+        r = sess.post(
+            f"{base}/cgi/login.cgi",
+            data={'name': server['username'], 'pwd': server['password']},
+            timeout=10,
+            allow_redirects=False,
+        )
+        steps.append({
+            'step': '1_login_post',
+            'status': r.status_code,
+            'location': r.headers.get('Location', ''),
+            'set_cookie': r.headers.get('Set-Cookie', ''),
+            'cookies_after': dict(sess.cookies),
+            'body_preview': r.text[:600],
+            'sid_in_body': _extract_sid_from_body(r.text),
+        })
+        # follow redirect if present
+        loc = r.headers.get('Location', '')
+        if loc and r.status_code in (301, 302, 303, 307, 308):
+            target = loc if loc.startswith('http') else f"{base}{loc}"
+            r2 = sess.get(target, timeout=10, allow_redirects=True)
+            steps.append({
+                'step': '2_login_redirect',
+                'url': target,
+                'status': r2.status_code,
+                'cookies_after': dict(sess.cookies),
+                'body_preview': r2.text[:400],
+                'sid_in_body': _extract_sid_from_body(r2.text),
+            })
+    except Exception as e:
+        steps.append({'step': '1_login_post', 'error': str(e)})
+
+    # Step 2: try all JNLP paths
+    sid = _pick_sid(sess.cookies)
+    for path in _JNLP_PATHS:
+        for suffix in ([''] if not sid else ['', f'{"&" if "?" in path else "?"}SID={sid}']):
+            url = f"{base}{path}{suffix}"
+            try:
+                r = sess.get(url, timeout=10)
+                steps.append({
+                    'step': f'jnlp_try',
+                    'url': url,
+                    'status': r.status_code,
+                    'content_type': r.headers.get('Content-Type', ''),
+                    'body_length': len(r.content),
+                    'is_jnlp': '<jnlp' in r.text.lower(),
+                    'body_preview': r.text[:600],
+                })
+            except Exception as e:
+                steps.append({'step': 'jnlp_try', 'url': url, 'error': str(e)})
+
+    result = {
+        'server_ip': server['ip'],
+        'username': server['username'],
+        'session_cookies': dict(sess.cookies),
+        'extracted_sid': _extract_sid_from_body(''.join(
+            s.get('body_preview', '') for s in steps
+        )),
+        'steps': steps,
+    }
+
+    # Return as nicely formatted HTML for easy reading in browser
+    import html as html_mod
+    rows = ''
+    for s in steps:
+        rows += f'<tr><th colspan="2" style="background:#21262d;padding:8px">{html_mod.escape(s.get("step",""))}</th></tr>'
+        for k, v in s.items():
+            if k == 'step':
+                continue
+            rows += (f'<tr><td style="color:#8b949e;padding:4px 8px;white-space:nowrap">{html_mod.escape(str(k))}</td>'
+                     f'<td style="padding:4px 8px"><pre style="margin:0;white-space:pre-wrap;word-break:break-all">'
+                     f'{html_mod.escape(str(v))}</pre></td></tr>')
+
+    page = f"""<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
+<title>JNLP Debug – {html_mod.escape(server['ip'])}</title>
+<style>body{{font-family:monospace;background:#0d1117;color:#e6edf3;padding:1rem}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #30363d;vertical-align:top}}
+pre{{background:#161b22;padding:6px;border-radius:4px;font-size:.8rem}}</style></head>
+<body>
+<h2>JNLP Debug: {html_mod.escape(server['ip'])}</h2>
+<p>Session Cookies: <code>{html_mod.escape(str(dict(sess.cookies)))}</code></p>
+<table>{rows}</table>
+<p style="margin-top:1rem;color:#8b949e">Bitte diesen Output für die weitere Diagnose bereitstellen.</p>
+</body></html>"""
+    return Response(page, content_type='text/html')
+
+
+def _jnlp_error(ip: str, message: str, debug_url: str = '') -> Response:
+    debug_link = (f'<p><a href="{debug_url}" target="_blank" '
+                  f'style="color:#e3b341">🔍 Debug-Diagnose öffnen &rarr;</a></p>') if debug_url else ''
     html = f"""<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8">
 <title>KVM Fehler</title>
 <style>body{{font-family:sans-serif;padding:2rem;background:#0d1117;color:#e6edf3}}
   h2{{color:#f85149}}a{{color:#79b8ff}}</style></head><body>
 <h2>KVM Konsolenfehler</h2>
 <p>{message}</p>
+{debug_link}
 <p><a href="https://{ip}" target="_blank">BMC Web-Interface direkt öffnen &rarr;</a></p>
 </body></html>"""
     return Response(html, content_type='text/html', status=502)
