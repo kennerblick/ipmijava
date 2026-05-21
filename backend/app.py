@@ -492,49 +492,127 @@ def _fetch_jnlp_from_mainmenu(sess: req_lib.Session, base: str, sid: str | None)
 
 @app.route('/api/servers/<server_id>/jnlp', methods=['GET'])
 def api_console_jnlp(server_id):
-    """Log in to the BMC, fetch iKVM JNLP, proxy it to the browser.
+    """Return an HTML relay page that logs the user's browser into the BMC
+    and opens the Console Redirection page (man_ikvm) in a new tab.
 
-    Handles both ATEN (SID in JS body) and AMI (SID as HTTP cookie) BMC firmware.
-    Java Web Start then connects directly from the client to the BMC.
+    Background: url_redirect.cgi?url_name=ikvm validates the requesting client IP
+    against the session's registered IP. A backend proxy therefore always gets 404 —
+    the JNLP is only served to the browser that originally established the session.
+    Solution: log the browser in via a hidden iframe (sets SID cookie in the user's
+    browser for the BMC domain), then open man_ikvm in a new tab where the user
+    clicks "Launch iKVM" to download the JNLP directly.
     """
     config = load_config()
     server, _ = find_server(config, server_id)
     if not server:
         return jsonify({'error': 'Server nicht gefunden'}), 404
 
-    base = f"https://{server['ip']}"
-    try:
-        sess, sid = _bmc_login(base, server['username'], server['password'])
-        jnlp_resp = _fetch_jnlp(sess, base, sid)
+    import html as html_mod
+    ip          = html_mod.escape(server['ip'])
+    username    = html_mod.escape(server['username'])
+    password    = html_mod.escape(server['password'])
+    bmc_base    = f"https://{server['ip']}"
+    login_url   = f"{bmc_base}/cgi/login.cgi"
+    console_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm"
 
-        if jnlp_resp is None:
-            debug_url = f"/api/servers/{server_id}/jnlp-debug"
-            return _jnlp_error(
-                server['ip'],
-                'BMC lieferte keine JNLP-Datei.<br>'
-                'Mögliche Ursachen: falsches Passwort, nur HTML5-KVM verfügbar, '
-                'oder abweichende Firmware-Version.',
-                debug_url,
-            )
+    page = f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>iKVM – {ip}</title>
+  <style>
+    body {{ font-family:sans-serif; background:#0d1117; color:#e6edf3;
+            display:flex; flex-direction:column; align-items:center;
+            justify-content:center; min-height:100vh; margin:0; padding:1rem; }}
+    h2  {{ margin-bottom:.5rem; }}
+    p   {{ color:#8b949e; margin:.4rem 0; font-size:.95rem; }}
+    .btn {{ display:inline-block; padding:.55rem 1.4rem; background:#1f6feb;
+             color:#fff; border:none; border-radius:6px; cursor:pointer;
+             font-size:1rem; text-decoration:none; margin:.5rem .2rem; }}
+    .btn:hover {{ background:#388bfd; }}
+    .btn-sec {{ background:#30363d; }}
+    .btn-sec:hover {{ background:#484f58; }}
+    #step2 {{ display:none; text-align:center; }}
+    #step-error {{ display:none; color:#f85149; text-align:center; }}
+    .spinner {{ display:inline-block; width:1.2rem; height:1.2rem;
+                border:3px solid #30363d; border-top-color:#58a6ff;
+                border-radius:50%; animation:spin .8s linear infinite;
+                vertical-align:middle; margin-right:.5rem; }}
+    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+  </style>
+</head>
+<body>
+  <!-- Hidden login frame — sets SID cookie in user's browser for the BMC domain -->
+  <iframe id="lf" name="lf" style="display:none" width="1" height="1"></iframe>
+  <form id="lf-form" action="{login_url}" method="post" target="lf">
+    <input type="hidden" name="name" value="{username}">
+    <input type="hidden" name="pwd"  value="{password}">
+  </form>
 
-        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', server['name'])
-        return Response(
-            jnlp_resp.content,
-            content_type='application/x-java-jnlp-file',
-            headers={
-                'Content-Disposition': f'attachment; filename="{safe_name}.jnlp"',
-                'Cache-Control': 'no-store',
-            },
-        )
+  <div id="step1" style="text-align:center">
+    <h2>iKVM Konsole — {ip}</h2>
+    <p><span class="spinner"></span>Anmeldung am BMC läuft…</p>
+    <p style="font-size:.8rem;margin-top:.8rem">Bitte warten</p>
+  </div>
 
-    except req_lib.exceptions.SSLError:
-        return _jnlp_error(server['ip'], 'SSL-Fehler (selbstsigniertes Zertifikat).')
-    except req_lib.exceptions.ConnectionError:
-        return _jnlp_error(server['ip'], f'BMC nicht erreichbar: {server["ip"]}')
-    except req_lib.exceptions.Timeout:
-        return _jnlp_error(server['ip'], 'Timeout beim Verbinden mit BMC.')
-    except Exception as e:
-        return _jnlp_error(server['ip'], str(e))
+  <div id="step2">
+    <h2>iKVM Konsole — {ip}</h2>
+    <p>Anmeldung erfolgreich. Die BMC-Konsole öffnet sich in einem neuen Tab.</p>
+    <p style="margin-top:.8rem">
+      <a id="console-link" href="{console_url}" target="_blank" class="btn">
+        🖥&nbsp;Konsole öffnen (neuer Tab)
+      </a>
+      <a href="{bmc_base}" target="_blank" class="btn btn-sec">BMC Web-UI</a>
+    </p>
+    <p style="font-size:.82rem;margin-top:.6rem;color:#8b949e">
+      Im neuen Tab auf <strong>Launch iKVM</strong> / <strong>Launch Console</strong> klicken.<br>
+      Die JNLP-Datei wird dann automatisch heruntergeladen.
+    </p>
+  </div>
+
+  <div id="step-error">
+    <h2 style="color:#f85149">Anmeldung fehlgeschlagen</h2>
+    <p>Zugangsdaten oder BMC-Verbindung prüfen.</p>
+    <a href="{bmc_base}" target="_blank" class="btn">BMC direkt öffnen</a>
+  </div>
+
+  <script>
+  (function() {{
+    var done = false;
+    var frame = document.getElementById('lf');
+
+    function onLoginDone() {{
+      if (done) return;
+      done = true;
+      document.getElementById('step1').style.display = 'none';
+      document.getElementById('step2').style.display = 'block';
+      // Auto-open the console tab
+      var w = window.open('{console_url}', '_blank', 'noopener,noreferrer');
+      if (!w) {{
+        // Popup blocked — manual button is already shown
+      }}
+    }}
+
+    frame.addEventListener('load', onLoginDone);
+
+    // Timeout fallback (12 s)
+    setTimeout(function() {{
+      if (!done) {{
+        done = true;
+        document.getElementById('step1').style.display = 'none';
+        document.getElementById('step-error').style.display = 'block';
+      }}
+    }}, 12000);
+
+    // Submit login after short render delay
+    setTimeout(function() {{
+      document.getElementById('lf-form').submit();
+    }}, 400);
+  }})();
+  </script>
+</body>
+</html>"""
+    return Response(page, content_type='text/html')
 
 
 @app.route('/api/servers/<server_id>/jnlp-debug', methods=['GET'])

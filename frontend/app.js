@@ -267,10 +267,10 @@ async function openConsole(serverId) {
 
     document.getElementById('console-server-name').textContent = srv?.name ?? serverId;
 
-    // JNLP is proxied through our backend (auto-login) — set as direct href so browser downloads it
+    // Opens our relay page in a new tab — relay logs browser into BMC and opens man_ikvm
     const jnlpBtn = document.getElementById('console-ikvm-btn');
-    jnlpBtn.href = data.jnlp_proxy;
-    jnlpBtn.removeAttribute('target');  // download in same context
+    jnlpBtn.href   = data.jnlp_proxy;
+    jnlpBtn.target = '_blank';
 
     document.getElementById('console-bmc-btn').href = data.bmc_url;
 
