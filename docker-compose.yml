@@ -6,10 +6,10 @@ services:
     # On Linux: network_mode: host gives nmap + IPMI full network access.
     # On Docker Desktop (macOS/Windows): comment out network_mode and
     # use the ports block below instead.
-    network_mode: host
-    # ports:
-    #   - "9193:9193"
-    #   - "6080-6089:6080-6089"   # websockify KVM sessions
+    # network_mode: host   # Linux only — not supported on Docker Desktop (Win/Mac)
+    ports:
+      - "9193:9193"
+      - "6080-6089:6080-6089"   # websockify KVM sessions
     volumes:
       - ./config:/config
     restart: unless-stopped

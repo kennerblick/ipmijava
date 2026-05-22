@@ -28,6 +28,131 @@ import requests as _req
 import urllib3 as _urllib3
 _urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
 
+# ── Playwright JNLP fetch ──────────────────────────────────────────────────────
+
+def _fetch_jnlp_playwright(base: str, username: str, password: str,
+                            progress_fn=None) -> Optional[str]:
+    """Use headless Chromium to execute the real browser flow and capture JNLP XML.
+
+    The BMC's url_redirect.cgi?url_name=ikvm validates the requesting client IP
+    against the registered session IP. Python-requests always gets "File Not Found"
+    because the session was created by the browser, not by the backend IP.
+    Playwright runs a real Chromium inside the container, so the IP matches and
+    the JNLP is served correctly.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        if progress_fn:
+            progress_fn('Playwright nicht installiert — überspringe')
+        return None
+
+    jnlp_box: dict = {'text': None}
+
+    def _on_response(response) -> None:
+        if jnlp_box['text']:
+            return
+        url = response.url
+        if 'url_name=ikvm' in url or url.lower().endswith('.jnlp'):
+            try:
+                text = response.text()
+                if '<jnlp' in text.lower():
+                    jnlp_box['text'] = text
+            except Exception:
+                pass
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-gpu',
+                    '--ignore-certificate-errors',
+                ],
+            )
+            ctx = browser.new_context(ignore_https_errors=True)
+            page = ctx.new_page()
+            page.on('response', _on_response)
+
+            # ── Login ─────────────────────────────────────────────────────────
+            if progress_fn:
+                progress_fn('Playwright: Login am BMC…')
+            try:
+                page.goto(f"{base}/cgi/login.cgi",
+                          wait_until='domcontentloaded', timeout=15_000)
+                page.locator('input[name="name"], input[name="username"]').first.fill(
+                    username, timeout=4_000)
+                page.locator('input[name="pwd"], input[name="password"]').first.fill(
+                    password, timeout=4_000)
+                page.locator('input[type="submit"], button[type="submit"]').first.click(
+                    timeout=4_000)
+                page.wait_for_load_state('networkidle', timeout=12_000)
+            except Exception:
+                # Fallback: inject and submit a form programmatically
+                try:
+                    page.evaluate(
+                        f"""() => {{
+                            const f = document.createElement('form');
+                            f.method = 'POST';
+                            f.action = '/cgi/login.cgi';
+                            [['name',{username!r}],['pwd',{password!r}]].forEach(([n,v])=>{{
+                                const i = document.createElement('input');
+                                i.name = n; i.value = v; f.appendChild(i);
+                            }});
+                            document.body.appendChild(f);
+                            f.submit();
+                        }}"""
+                    )
+                    page.wait_for_load_state('networkidle', timeout=12_000)
+                except Exception:
+                    pass
+
+            # ── Navigate to Console Redirection page ──────────────────────────
+            if progress_fn:
+                progress_fn('Playwright: Navigiere zu man_ikvm…')
+            page.goto(
+                f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                wait_until='domcontentloaded', timeout=15_000,
+            )
+            page.wait_for_timeout(2_500)   # let pollServer() run
+
+            # ── Click Launch button ───────────────────────────────────────────
+            if progress_fn:
+                progress_fn('Playwright: Klicke Launch iKVM…')
+            for sel in [
+                '#Launch',
+                'input[value*="Launch" i]',
+                'input[onclick*="GetJNLP" i]',
+                'input[onclick*="ikvm" i]',
+                'button:has-text("Launch")',
+                'input[type="button"]',
+                'input[type="submit"]',
+            ]:
+                if jnlp_box['text']:
+                    break
+                try:
+                    el = page.locator(sel).first
+                    if el.count() > 0 and el.is_visible(timeout=1_000):
+                        el.click(timeout=3_000)
+                        page.wait_for_timeout(3_000)
+                except Exception:
+                    continue
+
+            if not jnlp_box['text']:
+                page.wait_for_timeout(3_000)   # last chance
+
+            browser.close()
+            if progress_fn and jnlp_box['text']:
+                progress_fn('Playwright: JNLP erhalten!')
+            return jnlp_box['text']
+
+    except Exception as exc:
+        if progress_fn:
+            progress_fn(f'Playwright fehlgeschlagen: {exc}')
+        return None
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 _DISPLAY_START  = 10
@@ -390,25 +515,33 @@ def _do_run(sess: 'KvmSession', server: dict) -> None:
     sess.procs.append(ws)
     time.sleep(0.3)
 
-    # ── 4. BMC login ──────────────────────────────────────────────────────────
-    msg(f'Login am BMC {server["ip"]}…')
-    http_sess, sid = _bmc_login(base, server['username'], server['password'])
+    # ── 4. JNLP holen — Playwright (primär) → requests (Fallback) ────────────
+    msg('JNLP holen (Playwright)…')
+    jnlp_text = _fetch_jnlp_playwright(
+        base, server['username'], server['password'], progress_fn=msg)
 
-    # ── 5. JNLP fetch ─────────────────────────────────────────────────────────
-    resp = _fetch_jnlp(http_sess, base, sid, progress_fn=msg)
-    if not resp or '<jnlp' not in resp.text.lower():
+    if not jnlp_text:
+        msg(f'Login am BMC {server["ip"]} (Fallback)…')
+        http_sess, sid = _bmc_login(base, server['username'], server['password'])
+        resp = _fetch_jnlp(http_sess, base, sid, progress_fn=msg)
+        jnlp_text = resp.text if resp and '<jnlp' in (resp.text or '').lower() else None
+
+    if not jnlp_text:
         raise RuntimeError(
-            f'JNLP nicht gefunden — BMC Login OK (SID: {"ja" if sid else "nein"}), '
-            'aber keiner der JNLP-Pfade hat geantwortet. '
-            'BMC-Firmware-Version prüfen oder Debug-Endpoint nutzen.'
+            'JNLP nicht gefunden. Weder Playwright noch requests konnten das '
+            'JNLP liefern. Debug: /api/servers/<id>/jnlp-debug'
         )
 
-    # ── 6. Parse JNLP ─────────────────────────────────────────────────────────
+    # Für JAR-Download brauchen wir eine requests-Session (Playwright hat keine)
+    msg(f'Login am BMC {server["ip"]} (JAR-Download)…')
+    http_sess, sid = _bmc_login(base, server['username'], server['password'])
+
+    # ── 5. Parse JNLP ─────────────────────────────────────────────────────────
     msg('Analysiere JNLP…')
-    jars, native_jars, main_class, arguments = _parse_jnlp(resp.text, base)
+    jars, native_jars, main_class, arguments = _parse_jnlp(jnlp_text, base)
     if not main_class:
         raise RuntimeError(
-            f'Keine main-class im JNLP. JNLP-Inhalt (Anfang): {resp.text[:300]}'
+            f'Keine main-class im JNLP. JNLP-Inhalt (Anfang): {jnlp_text[:300]}'
         )
 
     # ── 7. JARs herunterladen ─────────────────────────────────────────────────

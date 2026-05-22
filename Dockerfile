@@ -3,7 +3,7 @@ FROM debian:bookworm-slim
 # System tools + X11 + VNC + Java + websockify
 RUN apt-get update && apt-get install -y --no-install-recommends \
         python3 python3-pip \
-        ipmitool nmap curl \
+        ipmitool nmap curl unzip \
         tigervnc-standalone-server \
         openjdk-17-jre \
         python3-websockify \
@@ -33,6 +33,11 @@ WORKDIR /app
 # Python deps (--break-system-packages needed on Debian Bookworm / PEP 668)
 COPY backend/requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+
+# Playwright: install Chromium + its system dependencies
+# PLAYWRIGHT_BROWSERS_PATH=0 puts browsers into /ms-playwright (root-accessible, no home-dir issue)
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+RUN playwright install --with-deps chromium
 
 # noVNC v1.4.0 static files (served by Flask at /novnc/)
 RUN curl -sL https://github.com/novnc/noVNC/archive/refs/tags/v1.4.0.tar.gz \

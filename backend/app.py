@@ -707,7 +707,9 @@ def api_html5_kvm(server_id):
     password  = html_mod.escape(server['password'])
     bmc_base  = f"https://{server['ip']}"
     login_url = f"{bmc_base}/cgi/login.cgi"
-    html5_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5"
+    # man_ikvm_html5 redirects to man_ikvm_html5_bootstrap on this firmware;
+    # use the bootstrap URL directly to avoid an extra redirect hop.
+    html5_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5_bootstrap"
 
     page = f"""<!DOCTYPE html>
 <html lang="de">
@@ -1267,6 +1269,35 @@ def api_kvm_start(server_id):
         }), 201
     except RuntimeError as e:
         return jsonify({'error': str(e)}), 503
+
+
+@app.route('/api/servers/<server_id>/kvm-viewer', methods=['GET'])
+def api_kvm_viewer(server_id):
+    """Serve an embedded noVNC viewer page for the active KVM session."""
+    sess = _kvm.get_session_for_server(server_id) if _KVM_AVAILABLE else None
+    if not sess or sess.status not in ('running', 'starting'):
+        return Response(
+            '<html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;'
+            'display:flex;align-items:center;justify-content:center;height:100vh;margin:0">'
+            '<p>Keine aktive KVM-Session</p></body></html>',
+            content_type='text/html',
+        )
+    host = request.host.split(':')[0]
+    ws_port = sess.port_ws
+    page = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>* {{ margin:0; padding:0; box-sizing:border-box }}
+    body {{ background:#000; overflow:hidden }}
+    iframe {{ width:100vw; height:100vh; border:none; display:block }}</style>
+</head>
+<body>
+  <iframe src="/novnc/vnc.html?host={host}&port={ws_port}&autoconnect=true&encrypt=false&resize=scale&logging=warn"
+          allow="fullscreen"></iframe>
+</body>
+</html>"""
+    return Response(page, content_type='text/html')
 
 
 @app.route('/api/servers/<server_id>/kvm-session', methods=['GET'])
