@@ -131,6 +131,8 @@ function renderGrid() {
 
 function serverCardHtml(server, status, groupId) {
   const { online, power, loading } = status;
+  const caps = server.caps;           // undefined = not yet probed
+  const probing = status.probing;
 
   let badge;
   if (loading) {
@@ -151,20 +153,13 @@ function serverCardHtml(server, status, groupId) {
 
   const dis = (!online || loading) ? ' disabled' : '';
 
-  return `
-    <div class="col-xxl-3 col-xl-4 col-lg-6 col-md-6" id="card-wrap-${server.id}">
-      <div class="card server-card h-100">
-        <div class="card-body d-flex flex-column gap-2">
-          <div class="d-flex justify-content-between align-items-start">
-            <span class="fw-semibold text-truncate me-2" title="${esc(server.name)}">${esc(server.name)}</span>
-            <div class="d-flex flex-shrink-0">${badge}${powerBadge}</div>
-          </div>
-          <div class="text-muted small">
-            <i class="bi bi-hdd-network me-1"></i>${esc(server.ip)}
-            ${server.description ? `<br><i class="bi bi-info-circle me-1"></i>${esc(server.description)}` : ''}
-          </div>
+  // caps === undefined  →  not yet probed, show all
+  // caps defined        →  show only supported features
+  const showIpmi    = !caps || caps.ipmi;
+  const showKvm     = !caps || caps.kvm_aten;
+  const showConsole = !caps || caps.kvm_aten || caps.ikvm_java || caps.bmc_http;
 
-          <!-- Power actions -->
+  const powerGroup = showIpmi ? `
           <div class="btn-group btn-group-sm mt-auto" role="group">
             <button class="btn btn-success${dis}" onclick="powerAction('${server.id}','on')" title="Power ON">
               <i class="bi bi-power"></i> ON
@@ -181,19 +176,36 @@ function serverCardHtml(server, status, groupId) {
             <button class="btn btn-outline-danger${dis}" onclick="powerAction('${server.id}','cycle')" title="Power Cycle (Hard Reset)">
               <i class="bi bi-lightning-charge-fill"></i>
             </button>
-          </div>
+          </div>` : `
+          <div class="mt-auto">
+            <span class="badge bg-secondary text-muted small">Kein IPMI</span>
+          </div>`;
 
+  const probeBtn = probing
+    ? `<button class="btn btn-sm btn-outline-warning disabled" title="Erkenne Funktionen…"><span class="spinner-border spinner-border-sm" style="width:.65rem;height:.65rem;"></span></button>`
+    : `<button class="btn btn-sm btn-outline-secondary" onclick="probeServer('${server.id}')" title="Funktionen neu erkennen"><i class="bi bi-cpu"></i></button>`;
+
+  return `
+    <div class="col-xxl-3 col-xl-4 col-lg-6 col-md-6" id="card-wrap-${server.id}">
+      <div class="card server-card h-100">
+        <div class="card-body d-flex flex-column gap-2">
+          <div class="d-flex justify-content-between align-items-start">
+            <span class="fw-semibold text-truncate me-2" title="${esc(server.name)}">${esc(server.name)}</span>
+            <div class="d-flex flex-shrink-0">${badge}${powerBadge}</div>
+          </div>
+          <div class="text-muted small">
+            <i class="bi bi-hdd-network me-1"></i>${esc(server.ip)}
+            ${server.description ? `<br><i class="bi bi-info-circle me-1"></i>${esc(server.description)}` : ''}
+          </div>
+          ${powerGroup}
           <!-- Secondary actions -->
-          <div class="d-flex gap-1">
-            <button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="HTML5 KVM (Browser-Konsole)">
-              <i class="bi bi-display"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Java iKVM / BMC-Optionen">
-              <i class="bi bi-window"></i>
-            </button>
+          <div class="d-flex gap-1 flex-wrap">
+            ${showKvm     ? `<button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="HTML5 KVM (Browser-Konsole)"><i class="bi bi-display"></i></button>` : ''}
+            ${showConsole ? `<button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Konsolen-Optionen"><i class="bi bi-window"></i></button>` : ''}
             <button class="btn btn-sm btn-outline-secondary" onclick="fetchStatus('${server.id}')" title="Status aktualisieren">
               <i class="bi bi-arrow-clockwise"></i>
             </button>
+            ${probeBtn}
             <button class="btn btn-sm btn-outline-secondary" onclick="editServer('${server.id}','${groupId}')" title="Bearbeiten">
               <i class="bi bi-pencil"></i>
             </button>
@@ -268,21 +280,28 @@ async function openConsole(serverId) {
   try {
     const data = await apiGet(`/servers/${serverId}/console-url`);
     const srv  = state.groups.flatMap(g => g.servers).find(s => s.id === serverId);
+    const caps = srv?.caps;   // undefined = not yet probed → show all
 
     document.getElementById('console-server-name').textContent = srv?.name ?? serverId;
 
-    // HTML5 KVM button — opens embedded kvmModal
-    document.getElementById('console-html5-btn').onclick = () => {
+    // HTML5 KVM button — show only if kvm_aten supported (or caps unknown)
+    const html5Btn = document.getElementById('console-html5-btn');
+    html5Btn.classList.toggle('d-none', caps && !caps.kvm_aten);
+    html5Btn.onclick = () => {
       bootstrap.Modal.getInstance(document.getElementById('consoleModal')).hide();
       openKvm(serverId);
     };
 
-    // Java iKVM relay — logs browser into BMC, navigates to man_ikvm (user clicks Launch)
+    // Java iKVM relay — show only if ikvm_java supported (or caps unknown)
     const jnlpBtn = document.getElementById('console-ikvm-btn');
+    jnlpBtn.classList.toggle('d-none', caps && !caps.ikvm_java);
     jnlpBtn.href   = data.jnlp_proxy;
     jnlpBtn.target = '_blank';
 
+    // Java fix — only useful with Java iKVM
+    document.getElementById('console-java-fix-btn').classList.toggle('d-none', caps && !caps.ikvm_java);
     document.getElementById('console-java-fix-btn').href = data.java_fix;
+
     document.getElementById('console-bmc-btn').href = data.bmc_url;
 
     new bootstrap.Modal(document.getElementById('consoleModal')).show();
@@ -399,10 +418,28 @@ async function saveServer() {
   if (!data.name || !data.ip) { alert('Name und IP erforderlich'); return; }
   if (id && targetGroupId !== origGroupId) data.group_id = targetGroupId;
   try {
-    if (id) { await apiPut(`/servers/${id}`, data); }
-    else    { await apiPost(`/groups/${origGroupId}/servers`, data); }
+    let saved;
+    if (id) { saved = await apiPut(`/servers/${id}`, data); }
+    else    { saved = await apiPost(`/groups/${origGroupId}/servers`, data); }
     bootstrap.Modal.getInstance(document.getElementById('serverModal')).hide();
     await loadGroups();
+    // Trigger capability probe in background
+    const probeId = id || saved.id;
+    showToast('Erkenne Server-Funktionen…', 'secondary');
+    state.statuses[probeId] = { ...(state.statuses[probeId] || {}), probing: true };
+    updateCardInPlace(probeId);
+    apiPost(`/servers/${probeId}/probe`).then(caps => {
+      for (const g of state.groups) {
+        const srv = g.servers.find(s => s.id === probeId);
+        if (srv) { srv.caps = caps; break; }
+      }
+      state.statuses[probeId] = { ...(state.statuses[probeId] || {}), probing: false };
+      updateCardInPlace(probeId);
+      showToast(`Funktionen: ${_capsLabel(caps)}`, 'success');
+    }).catch(() => {
+      state.statuses[probeId] = { ...(state.statuses[probeId] || {}), probing: false };
+      updateCardInPlace(probeId);
+    });
   } catch (e) {
     showToast(`Fehler: ${e.message}`, 'danger');
   }
@@ -416,6 +453,34 @@ async function deleteServer(id) {
   } catch (e) {
     showToast(`Fehler: ${e.message}`, 'danger');
   }
+}
+
+async function probeServer(serverId) {
+  state.statuses[serverId] = { ...(state.statuses[serverId] || {}), probing: true };
+  updateCardInPlace(serverId);
+  try {
+    const caps = await apiPost(`/servers/${serverId}/probe`);
+    // Update the caps on the in-memory server object so the card re-renders correctly
+    for (const g of state.groups) {
+      const srv = g.servers.find(s => s.id === serverId);
+      if (srv) { srv.caps = caps; break; }
+    }
+    showToast(`Funktionen erkannt: ${_capsLabel(caps)}`, 'success');
+  } catch (e) {
+    showToast(`Probe-Fehler: ${e.message}`, 'danger');
+  } finally {
+    state.statuses[serverId] = { ...(state.statuses[serverId] || {}), probing: false };
+    updateCardInPlace(serverId);
+  }
+}
+
+function _capsLabel(caps) {
+  const parts = [];
+  if (caps.ipmi)      parts.push('IPMI');
+  if (caps.kvm_aten)  parts.push('HTML5-KVM');
+  if (caps.ikvm_java) parts.push('Java-iKVM');
+  if (caps.bmc_http)  parts.push('BMC-Web');
+  return parts.length ? parts.join(', ') : 'keine';
 }
 
 

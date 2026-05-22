@@ -614,6 +614,43 @@ def _run_ws_proxy(local_port: int, bmc_uri: str, cookies: dict,
         loop.close()
 
 
+def _activate_ikvm_service(http_sess, base: str) -> None:
+    """Simulate full browser navigation to activate the BMC's iKVM service.
+
+    Some ATEN firmware variants (e.g. B16NA) require the browser to navigate
+    to man_ikvm and poll upgrade_process.cgi before the WebSocket endpoint at
+    wss://BMC:443/ will start sending RFB data.  Without this sequence the BMC
+    accepts the WebSocket connection silently but never initiates the handshake.
+    """
+    topmenu_url  = f"{base}/cgi/url_redirect.cgi?url_name=topmenu"
+    man_ikvm_url = f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm"
+    poll_url     = f"{base}/cgi/upgrade_process.cgi"
+
+    for url in (f"{base}/cgi/url_redirect.cgi?url_name=mainmenu", topmenu_url):
+        try:
+            http_sess.get(url, timeout=6)
+        except Exception:
+            pass
+
+    http_sess.cookies.set('mainpage', 'remote')
+    http_sess.cookies.set('subpage',  'man_ikvm')
+
+    try:
+        http_sess.get(man_ikvm_url, timeout=10, headers={'Referer': topmenu_url})
+    except Exception:
+        pass
+
+    poll_hdrs = {
+        'Referer':      man_ikvm_url,
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    for _ in range(2):
+        try:
+            http_sess.post(poll_url, data='fwtype=255', headers=poll_hdrs, timeout=8)
+        except Exception:
+            pass
+
+
 def _do_run(sess: 'KvmSession', server: dict) -> None:
     base = f"https://{server['ip']}"
 
@@ -624,7 +661,13 @@ def _do_run(sess: 'KvmSession', server: dict) -> None:
     msg(f'Login am BMC {server["ip"]}…')
     http_sess, _sid = _bmc_login(base, server['username'], server['password'])
 
-    # ── 2. Fetch entry_value auth token from HTML5 bootstrap page ────────────
+    # ── 2. Activate iKVM service (navigate to man_ikvm + poll upgrade_process) ─
+    # Some ATEN firmware (e.g. B16NA) requires this before the BMC WebSocket
+    # starts sending RFB data. For firmware that doesn't need it this is a no-op.
+    msg('Aktiviere iKVM-Dienst am BMC…')
+    _activate_ikvm_service(http_sess, base)
+
+    # ── 3. Fetch entry_value auth token from HTML5 bootstrap page ────────────
     msg('Hole HTML5-KVM Authentifizierungstoken…')
     try:
         r = http_sess.get(

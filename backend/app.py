@@ -221,6 +221,127 @@ def api_scan_import():
     return jsonify({'created': created, 'skipped': len(ips) - created, 'group_id': ungrouped['id']}), 201
 
 
+# ── WebSocket RFB check ───────────────────────────────────────────────────────
+
+def _check_ws_rfb(ip: str, cookies: dict, timeout: float = 4.0) -> bool:
+    """Return True if BMC WebSocket at wss://IP:443/ sends RFB data within timeout.
+
+    Some older ATEN firmware has the HTML5 bootstrap page and entry_value token
+    but the WebSocket never initiates the RFB handshake.  This distinguishes those
+    from firmware where the WebSocket KVM actually works.
+    """
+    import asyncio as _aio
+    import ssl as _ssl_mod
+    import threading as _threading
+
+    try:
+        import websockets as _ws_lib
+    except ImportError:
+        return False
+
+    ssl_ctx = _ssl_mod.SSLContext(_ssl_mod.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = _ssl_mod.CERT_NONE
+    cookie_hdr = '; '.join(f'{k}={v}' for k, v in cookies.items())
+
+    async def _test() -> bool:
+        try:
+            async with _ws_lib.connect(
+                f'wss://{ip}:443/',
+                ssl=ssl_ctx,
+                additional_headers={
+                    'Origin': f'https://{ip}',
+                    'Cookie': cookie_hdr,
+                },
+                ping_interval=None,
+                open_timeout=timeout,
+            ) as ws:
+                data = await _aio.wait_for(ws.recv(), timeout=timeout)
+                return b'RFB' in data
+        except Exception:
+            return False
+
+    result: list[bool] = [False]
+
+    def _run_in_thread():
+        result[0] = _aio.run(_test())
+
+    t = _threading.Thread(target=_run_in_thread, daemon=True)
+    t.start()
+    t.join(timeout=timeout + 3)
+    return result[0]
+
+
+# ── Capability probe ──────────────────────────────────────────────────────────
+
+def _probe_server_caps(server: dict) -> dict:
+    """Probe a server for supported features and return a caps dict."""
+    caps = {
+        'bmc_http':  False,
+        'ipmi':      False,
+        'kvm_aten':  False,   # ATEN HTML5 KVM via WebSocket proxy
+        'ikvm_java': False,   # Java JNLP available
+    }
+
+    # 1. BMC reachable via HTTP(S)
+    caps['bmc_http'] = check_bmc_reachable(server['ip'])
+
+    # 2. IPMI (ipmitool lanplus)
+    ok, _, _ = run_ipmitool(server, 'power', 'status', timeout=10)
+    caps['ipmi'] = ok
+
+    if not caps['bmc_http']:
+        return caps
+
+    base = f"https://{server['ip']}"
+
+    # 3. Try BMC login — needed for HTML5 KVM and JNLP probes
+    try:
+        sess, sid = _bmc_login(base, server['username'], server['password'])
+    except Exception:
+        return caps
+
+    if not sid:
+        return caps
+
+    # 4. ATEN HTML5 KVM: bootstrap page must contain entry_value AND WebSocket must
+    #    send RFB data.  Some older ATEN firmware (e.g. B16NA) has the bootstrap page
+    #    and entry_value but the WebSocket at wss://BMC:443/ never sends RFB data —
+    #    in that case kvm_aten stays False even though the page loads.
+    try:
+        r = sess.get(
+            f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5_bootstrap",
+            timeout=10,
+        )
+        if r.status_code == 200 and re.search(r'entry_value', r.text, re.I):
+            bmc_cookies = {c.name: c.value for c in sess.cookies}
+            caps['kvm_aten'] = _check_ws_rfb(server['ip'], bmc_cookies)
+    except Exception:
+        pass
+
+    # 5. Java JNLP — try all static paths + navigation scrape
+    if not caps['ikvm_java']:
+        try:
+            jnlp = _fetch_jnlp(sess, base, sid)
+            caps['ikvm_java'] = bool(jnlp and '<jnlp' in jnlp.text.lower())
+        except Exception:
+            pass
+
+    return caps
+
+
+@app.route('/api/servers/<server_id>/probe', methods=['POST'])
+def api_probe_server(server_id):
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Nicht gefunden'}), 404
+    caps = _probe_server_caps(server)
+    server['caps'] = caps
+    save_config(config)
+    return jsonify(caps)
+
+
 # ── Status & Power ──────────────────────────────────────────────────────────────
 
 @app.route('/api/servers/<server_id>/status', methods=['GET'])
@@ -311,6 +432,7 @@ def api_java_fix(server_id):
 _JNLP_PATHS = [
     # url_redirect.cgi variants
     '/cgi/url_redirect.cgi?url_name=ikvm',
+    '/cgi/url_redirect.cgi?url_name=ikvm&url_type=jwsk',  # older ATEN (B16NA) firmware
     '/cgi/url_redirect.cgi?url_name=launch',       # matches downloaded filename "launch.jnlp"
     '/cgi/url_redirect.cgi?url_name=java_iview',
     '/cgi/url_redirect.cgi?url_name=iview',
@@ -1481,22 +1603,35 @@ def kvm_html5_view(session_id):
     except Exception as e:
         return Response(f'<p>Bootstrap-Seite nicht abrufbar: {e}</p>', status=502, content_type='text/html')
 
-    # Rewrite ../xxx relative URLs to go through our asset proxy
-    html = re.sub(
-        r'(src|href)="\.\./([^"]+)"',
-        lambda m: f'{m.group(1)}="/kvm/{session_id}/proxy/{m.group(2)}"',
-        html,
-    )
+    # Rewrite ALL quoted ../xxx references — both HTML attributes (src, href) and
+    # JavaScript string literals (e.g. loadScript("../novnc/include/nav_ui.js")).
+    # This handles firmware variants that load nav_ui.js dynamically instead of
+    # via a static <script src="..."> tag.
+    proxy_prefix = f'/kvm/{session_id}/proxy/'
 
-    # Inject INCLUDE_URI so Util.load_scripts() fetches scripts through our proxy
+    def _rewrite_url(m):
+        quote, path = m.group(1), m.group(2)
+        return f'{quote}{proxy_prefix}{path}{quote}'
+
+    # Replace "../xxx" and '../xxx' everywhere
+    html = re.sub(r'(["\'])\.\./([^"\']+)\1', _rewrite_url, html)
+
+    # Inject INCLUDE_URI so Util.load_scripts() fetches scripts through our proxy.
+    # Handles both direct <script src="...util.js"> and dynamic loadScript() cases.
     include_inject = (
-        f'<script>var INCLUDE_URI = "/kvm/{session_id}/proxy/novnc/include/";</script>\n'
+        f'<script>var INCLUDE_URI = "{proxy_prefix}novnc/include/";</script>\n'
     )
-    html = html.replace(
-        f'<script src="/kvm/{session_id}/proxy/novnc/include/util.js">',
-        f'{include_inject}<script src="/kvm/{session_id}/proxy/novnc/include/util.js">',
-        1,
-    )
+    util_js_tag = f'<script src="{proxy_prefix}novnc/include/util.js'
+    idx = html.find(util_js_tag)
+    if idx != -1:
+        html = html[:idx] + include_inject + html[idx:]
+    else:
+        # Fallback: inject before first </head> or at the start of <body>
+        for anchor in ('</head>', '<body'):
+            i = html.lower().find(anchor)
+            if i != -1:
+                html = html[:i] + include_inject + html[i:]
+                break
 
     return Response(html, content_type='text/html; charset=utf-8')
 
@@ -1524,19 +1659,30 @@ def kvm_proxy_asset(session_id, asset_path):
     content = r.content
     ct = r.headers.get('Content-Type', 'application/octet-stream')
 
-    # Patch nav_ui.js: hardcode our WebSocket proxy port and disable encryption
-    # (browser connects ws:// to our proxy; proxy forwards wss:// to BMC)
-    if asset_path.endswith('nav_ui.js'):
+    # Patch nav_ui.js: hardcode our WebSocket proxy port and disable encryption.
+    # Two firmware variants exist:
+    #   Newer (B26NA+): get_port() function → replace entire function
+    #   Older (.192/.178): inline port= assignment → regex-replace the assignment block
+    if 'nav_ui.js' in asset_path.split('/')[-1]:
         try:
             text = content.decode('utf-8', errors='replace')
-            text = re.sub(
-                r'port=window\.location\.port;'
-                r'if\(window\.location\.protocol\.substring\(0,5\)=="https"\)\{[^}]*\}'
-                r'else if\(window\.location\.protocol\.substring\(0,4\)=="http"\)\{[^}]*\}',
-                f'port={ws_port};encrypt=false;',
+            # Strategy 1: replace the get_port() function wholesale (newer ATEN)
+            new_fn = f'function get_port(){{return{{port:{ws_port},encrypt:false}}}}'
+            patched = re.sub(
+                r'function get_port\(\)\{(?:[^{}]|\{[^{}]*\})*\}',
+                new_fn,
                 text,
             )
-            content = text.encode('utf-8')
+            if patched == text:
+                # Strategy 2: patch inline port= assignment (older ATEN)
+                patched = re.sub(
+                    r'port=window\.location\.port;'
+                    r'if\(window\.location\.protocol\.substring\(0,5\)=="https"\)\{[^}]*\}'
+                    r'(?:else if\(window\.location\.protocol\.substring\(0,4\)=="http"\)\{[^}]*\})?',
+                    f'port={ws_port};encrypt=false;',
+                    text,
+                )
+            content = patched.encode('utf-8')
         except Exception:
             pass
 
