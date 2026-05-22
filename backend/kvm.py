@@ -1,25 +1,22 @@
 """KVM session manager.
 
 Each session owns:
-  - an Xvfb virtual display
-  - an x11vnc server on that display
-  - a websockify WebSocket→TCP bridge
-  - a Java process running the iKVM JAR directly (no javaws)
+  - a websockify WebSocket→TCP bridge to the BMC's VNC port (IKVM_PORT from GETPORTSINFO)
+  - noVNC in the browser connects via the WebSocket bridge
 
 Sessions are tracked in-process; gunicorn must run with a single worker.
 """
 
-import os
+import asyncio
 import re
 import shutil
 import socket
+import ssl as _ssl
 import subprocess
 import tempfile
 import threading
 import time
 import uuid
-import xml.etree.ElementTree as ET
-import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -32,13 +29,18 @@ _urllib3.disable_warnings(_urllib3.exceptions.InsecureRequestWarning)
 
 def _fetch_jnlp_playwright(base: str, username: str, password: str,
                             progress_fn=None) -> Optional[str]:
-    """Use headless Chromium to execute the real browser flow and capture JNLP XML.
+    """Use headless Chromium to fetch the JNLP from BMC.
 
-    The BMC's url_redirect.cgi?url_name=ikvm validates the requesting client IP
-    against the registered session IP. Python-requests always gets "File Not Found"
-    because the session was created by the browser, not by the backend IP.
-    Playwright runs a real Chromium inside the container, so the IP matches and
-    the JNLP is served correctly.
+    Strategy:
+    1. Login via Chromium (establishes cookie-based session)
+    2. Load man_ikvm so the BMC's JavaScript (pollServer / GetJNLPRequest) runs
+    3. Fetch the JNLP URL using the browser's fetch() API (keeps session cookies)
+    4. Fallback: page.goto() directly to the JNLP URL and read the body
+
+    This works where python-requests fails because the BMC session is tied to the
+    IP that first established it.  Chromium runs inside the same container, so the
+    IP matches.  Python-requests creates a *separate* session with the same IP but
+    different internal state — Chromium also executes the BMC's JavaScript fully.
     """
     try:
         from playwright.sync_api import sync_playwright
@@ -47,19 +49,40 @@ def _fetch_jnlp_playwright(base: str, username: str, password: str,
             progress_fn('Playwright nicht installiert — überspringe')
         return None
 
-    jnlp_box: dict = {'text': None}
+    def _pw_login(page, base, username, password):
+        """Login to ATEN/AMI BMC via Playwright.
 
-    def _on_response(response) -> None:
-        if jnlp_box['text']:
-            return
-        url = response.url
-        if 'url_name=ikvm' in url or url.lower().endswith('.jnlp'):
+        ATEN login form quirks:
+        - Submit button: <input id="login_word" onclick="javascript: checkform(this)">
+          NOT type="submit" — requires clicking #login_word to trigger checkform().
+        - checkform() validates the form and then submits it.
+        - Never bypass checkform() with a raw form.submit() — the BMC may reject it.
+        """
+        page.goto(f"{base}/cgi/login.cgi",
+                  wait_until='domcontentloaded', timeout=15_000)
+        # Fill credentials (same field names regardless of firmware generation)
+        for name_sel in ['input[name="name"]', 'input[name="username"]', 'input#name']:
             try:
-                text = response.text()
-                if '<jnlp' in text.lower():
-                    jnlp_box['text'] = text
+                page.locator(name_sel).first.fill(username, timeout=2_000)
+                break
             except Exception:
-                pass
+                continue
+        for pwd_sel in ['input[name="pwd"]', 'input[name="password"]', 'input#pwd']:
+            try:
+                page.locator(pwd_sel).first.fill(password, timeout=2_000)
+                break
+            except Exception:
+                continue
+        # Click the login button — ATEN uses onclick="checkform(this)" not type=submit
+        btn_sel = (
+            '#login_word, '                        # ATEN legacy
+            'input[onclick*="checkform" i], '       # ATEN with checkform()
+            'input[value*="login" i], '             # value="Login"
+            'input[type="submit"], '                # standard
+            'button[type="submit"]'                 # standard
+        )
+        page.locator(btn_sel).first.click(timeout=5_000)
+        page.wait_for_load_state('networkidle', timeout=12_000)
 
     try:
         with sync_playwright() as pw:
@@ -74,79 +97,110 @@ def _fetch_jnlp_playwright(base: str, username: str, password: str,
             )
             ctx = browser.new_context(ignore_https_errors=True)
             page = ctx.new_page()
-            page.on('response', _on_response)
 
-            # ── Login ─────────────────────────────────────────────────────────
             if progress_fn:
                 progress_fn('Playwright: Login am BMC…')
+            _pw_login(page, base, username, password)
+
+            # Inject SID into window scope BEFORE man_ikvm's JavaScript runs.
+            # ATEN's utils.js references top.SID in GETPORTSINFO / upgrade_process
+            # XHR calls.  When man_ikvm loads outside a frameset (top === window),
+            # top.SID is undefined → the BMC rejects the API call → JS redirects
+            # to login.  add_init_script() fires before any in-page script.
+            sid_val = next(
+                (c['value'] for c in ctx.cookies() if c['name'] == 'SID'), ''
+            )
+            if sid_val:
+                ctx.add_init_script(
+                    f"window.SID = '{sid_val}'; "
+                    "window.lang_setting = window.lang_setting || 'English';"
+                )
+
+            # Set the navigation cookies man_ikvm expects
+            bmc_host = base.replace('https://', '')
+            for cname, cval in [('mainpage', 'remote'), ('subpage', 'man_ikvm')]:
+                ctx.add_cookies([
+                    {'name': cname, 'value': cval, 'domain': bmc_host, 'path': '/'},
+                ])
+
+            # Load man_ikvm — with SID injected, pollServer() / GetJNLPRequest() will run
+            if progress_fn:
+                progress_fn('Playwright: Lade man_ikvm (pollServer)…')
             try:
-                page.goto(f"{base}/cgi/login.cgi",
-                          wait_until='domcontentloaded', timeout=15_000)
-                page.locator('input[name="name"], input[name="username"]').first.fill(
-                    username, timeout=4_000)
-                page.locator('input[name="pwd"], input[name="password"]').first.fill(
-                    password, timeout=4_000)
-                page.locator('input[type="submit"], button[type="submit"]').first.click(
-                    timeout=4_000)
-                page.wait_for_load_state('networkidle', timeout=12_000)
+                page.goto(
+                    f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                    wait_until='domcontentloaded', timeout=15_000,
+                )
+                page.wait_for_timeout(3_500)   # give pollServer() time to fire
             except Exception:
-                # Fallback: inject and submit a form programmatically
+                pass
+
+            jnlp_url = f"{base}/cgi/url_redirect.cgi?url_name=ikvm"
+
+            # ── Method A: browser fetch() (keeps session cookies, same IP) ───
+            if progress_fn:
+                progress_fn('Playwright: fetch JNLP via browser…')
+            try:
+                jnlp_text = page.evaluate(
+                    f"""async () => {{
+                        const r = await fetch({jnlp_url!r}, {{credentials:'include'}});
+                        return await r.text();
+                    }}"""
+                )
+                if jnlp_text and '<jnlp' in jnlp_text.lower():
+                    browser.close()
+                    if progress_fn:
+                        progress_fn('Playwright: JNLP via fetch erhalten!')
+                    return jnlp_text
+            except Exception:
+                pass
+
+            # ── Method B: page.goto() directly (captures response body) ──────
+            if progress_fn:
+                progress_fn('Playwright: goto JNLP URL…')
+            try:
+                resp = page.goto(jnlp_url, wait_until='commit', timeout=10_000)
+                if resp:
+                    body = resp.body().decode('utf-8', errors='replace')
+                    if '<jnlp' in body.lower():
+                        browser.close()
+                        if progress_fn:
+                            progress_fn('Playwright: JNLP via goto erhalten!')
+                        return body
+                # Also check rendered page source (for text/xml responses)
                 try:
-                    page.evaluate(
-                        f"""() => {{
-                            const f = document.createElement('form');
-                            f.method = 'POST';
-                            f.action = '/cgi/login.cgi';
-                            [['name',{username!r}],['pwd',{password!r}]].forEach(([n,v])=>{{
-                                const i = document.createElement('input');
-                                i.name = n; i.value = v; f.appendChild(i);
-                            }});
-                            document.body.appendChild(f);
-                            f.submit();
-                        }}"""
-                    )
-                    page.wait_for_load_state('networkidle', timeout=12_000)
+                    content = page.content()
+                    if '<jnlp' in content.lower():
+                        browser.close()
+                        return content
                 except Exception:
                     pass
+            except Exception:
+                pass
 
-            # ── Navigate to Console Redirection page ──────────────────────────
-            if progress_fn:
-                progress_fn('Playwright: Navigiere zu man_ikvm…')
-            page.goto(
-                f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
-                wait_until='domcontentloaded', timeout=15_000,
-            )
-            page.wait_for_timeout(2_500)   # let pollServer() run
-
-            # ── Click Launch button ───────────────────────────────────────────
-            if progress_fn:
-                progress_fn('Playwright: Klicke Launch iKVM…')
-            for sel in [
-                '#Launch',
-                'input[value*="Launch" i]',
-                'input[onclick*="GetJNLP" i]',
-                'input[onclick*="ikvm" i]',
-                'button:has-text("Launch")',
-                'input[type="button"]',
-                'input[type="submit"]',
+            # ── Method C: try other known JNLP paths via browser fetch ────────
+            for path in [
+                '/cgi/CGI_GetJNLPContent.cgi',
+                '/cgi/url_redirect.cgi?url_name=launch',
+                '/cgi/url_redirect.cgi?url_name=man_ikvm',
             ]:
-                if jnlp_box['text']:
-                    break
                 try:
-                    el = page.locator(sel).first
-                    if el.count() > 0 and el.is_visible(timeout=1_000):
-                        el.click(timeout=3_000)
-                        page.wait_for_timeout(3_000)
+                    jnlp_text = page.evaluate(
+                        f"""async () => {{
+                            const r = await fetch({(base + path)!r}, {{credentials:'include'}});
+                            return await r.text();
+                        }}"""
+                    )
+                    if jnlp_text and '<jnlp' in jnlp_text.lower():
+                        browser.close()
+                        return jnlp_text
                 except Exception:
                     continue
 
-            if not jnlp_box['text']:
-                page.wait_for_timeout(3_000)   # last chance
-
             browser.close()
-            if progress_fn and jnlp_box['text']:
-                progress_fn('Playwright: JNLP erhalten!')
-            return jnlp_box['text']
+            if progress_fn:
+                progress_fn('Playwright: kein JNLP gefunden')
+            return None
 
     except Exception as exc:
         if progress_fn:
@@ -196,16 +250,19 @@ _sessions: dict           = {}   # session_id -> KvmSession
 
 @dataclass
 class KvmSession:
-    session_id: str
-    server_id:  str
-    display:    int
-    port_vnc:   int
-    port_ws:    int
-    tmpdir:     str
-    procs:   list = field(default_factory=list)
-    status:  str  = 'starting'   # starting | running | error | stopped
-    message: str  = 'Initialisiere…'
-    error:   str  = ''
+    session_id:   str
+    server_id:    str
+    display:      int
+    port_vnc:     int
+    port_ws:      int
+    tmpdir:       str
+    procs:        list = field(default_factory=list)
+    status:       str  = 'starting'   # starting | running | error | stopped
+    message:      str  = 'Initialisiere…'
+    error:        str  = ''
+    vnc_password: str  = ''
+    bmc_ip:       str  = ''
+    bmc_cookies:  dict = field(default_factory=dict)
 
 
 # ── Allocation helpers ────────────────────────────────────────────────────────
@@ -429,12 +486,10 @@ def start_session(server: dict) -> 'KvmSession':
         active = [s for s in _sessions.values() if s.status in ('starting', 'running')]
         if len(active) >= _MAX_SESSIONS:
             raise RuntimeError('Zu viele aktive KVM-Sessions (max 10)')
-        sid      = str(uuid.uuid4())[:8]
-        display  = _alloc_display()
-        port_vnc = _alloc_port(_PORT_VNC_START)
-        port_ws  = _alloc_port(_PORT_WS_START)
-        tmpdir   = tempfile.mkdtemp(prefix='kvm_')
-        sess     = KvmSession(sid, server['id'], display, port_vnc, port_ws, tmpdir)
+        sid     = str(uuid.uuid4())[:8]
+        port_ws = _alloc_port(_PORT_WS_START)
+        tmpdir  = tempfile.mkdtemp(prefix='kvm_')
+        sess    = KvmSession(sid, server['id'], 0, 0, port_ws, tmpdir)
         _sessions[sid] = sess
 
     threading.Thread(
@@ -482,133 +537,133 @@ def _run(sess: 'KvmSession', server: dict) -> None:
         threading.Thread(target=_deferred_remove, daemon=True).start()
 
 
+def _run_ws_proxy(local_port: int, bmc_uri: str, cookies: dict,
+                  stop_event: threading.Event) -> None:
+    """Asyncio WebSocket-to-WebSocket proxy.
+
+    Accepts plain ws:// connections from the browser and forwards them to the
+    BMC's TLS WebSocket at wss://BMC:443/ with the BMC session cookies injected.
+    The BMC uses the ATEN-proprietary RFB 055.008 protocol which requires its
+    own noVNC client — this proxy is transparent to the RFB protocol.
+    """
+    import websockets  # installed at runtime; not in top-level imports
+
+    ssl_ctx = _ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT)
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = _ssl.CERT_NONE
+
+    bmc_host = bmc_uri.split('/')[2]
+    cookie_header = '; '.join(f'{k}={v}' for k, v in cookies.items())
+    extra_headers = {
+        'Cookie': cookie_header,
+        'Origin': f'https://{bmc_host}',
+    }
+
+    async def proxy_handler(browser_ws):
+        try:
+            async with websockets.connect(
+                bmc_uri,
+                ssl=ssl_ctx,
+                additional_headers=extra_headers,
+                ping_interval=None,
+                max_size=None,
+                compression=None,
+            ) as bmc_ws:
+                async def fwd(src, dst):
+                    try:
+                        async for msg in src:
+                            await dst.send(msg)
+                    except Exception:
+                        pass
+
+                t1 = asyncio.create_task(fwd(browser_ws, bmc_ws))
+                t2 = asyncio.create_task(fwd(bmc_ws, browser_ws))
+                done, pending = await asyncio.wait(
+                    [t1, t2], return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending:
+                    t.cancel()
+        except Exception:
+            pass
+
+    async def main():
+        async with websockets.serve(
+            proxy_handler,
+            '0.0.0.0',
+            local_port,
+            subprotocols=['binary', 'base64'],
+            ping_interval=None,
+            max_size=None,
+            compression=None,
+        ):
+            while not stop_event.is_set():
+                await asyncio.sleep(0.5)
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    finally:
+        loop.close()
+
+
 def _do_run(sess: 'KvmSession', server: dict) -> None:
-    base   = f"https://{server['ip']}"
-    tmpdir = Path(sess.tmpdir)
-    disp   = f':{sess.display}'
+    base = f"https://{server['ip']}"
 
     def msg(text: str) -> None:
         sess.message = text
 
-    # ── 1. TigerVNC (X-Server + VNC integriert, ersetzt Xvfb + x11vnc) ──────
-    msg('Starte TigerVNC (X + VNC)…')
-    vnc = subprocess.Popen(
-        ['Xtigervnc', disp,
-         '-rfbport', str(sess.port_vnc),
-         '-SecurityTypes', 'None',
-         '-geometry', '1280x800',
-         '-depth', '24',
-         '-ac', '+extension', 'GLX'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    sess.procs.append(vnc)
-    time.sleep(1.5)
-    if vnc.poll() is not None:
-        raise RuntimeError('Xtigervnc konnte nicht gestartet werden')
+    # ── 1. BMC login ─────────────────────────────────────────────────────────
+    msg(f'Login am BMC {server["ip"]}…')
+    http_sess, _sid = _bmc_login(base, server['username'], server['password'])
 
-    # ── 2. websockify ─────────────────────────────────────────────────────────
-    msg(f'Starte WebSocket-Proxy (Port {sess.port_ws})…')
-    ws = subprocess.Popen(
-        ['websockify', str(sess.port_ws), f'127.0.0.1:{sess.port_vnc}'],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    sess.procs.append(ws)
-    time.sleep(0.3)
-
-    # ── 4. JNLP holen — Playwright (primär) → requests (Fallback) ────────────
-    msg('JNLP holen (Playwright)…')
-    jnlp_text = _fetch_jnlp_playwright(
-        base, server['username'], server['password'], progress_fn=msg)
-
-    if not jnlp_text:
-        msg(f'Login am BMC {server["ip"]} (Fallback)…')
-        http_sess, sid = _bmc_login(base, server['username'], server['password'])
-        resp = _fetch_jnlp(http_sess, base, sid, progress_fn=msg)
-        jnlp_text = resp.text if resp and '<jnlp' in (resp.text or '').lower() else None
-
-    if not jnlp_text:
-        raise RuntimeError(
-            'JNLP nicht gefunden. Weder Playwright noch requests konnten das '
-            'JNLP liefern. Debug: /api/servers/<id>/jnlp-debug'
+    # ── 2. Fetch entry_value auth token from HTML5 bootstrap page ────────────
+    msg('Hole HTML5-KVM Authentifizierungstoken…')
+    try:
+        r = http_sess.get(
+            f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm_html5_bootstrap",
+            timeout=10,
         )
+        m = re.search(r'id="entry_value"\s+value="([^"]+)"', r.text)
+        entry_value = m.group(1) if m else ''
+    except Exception:
+        entry_value = ''
 
-    # Für JAR-Download brauchen wir eine requests-Session (Playwright hat keine)
-    msg(f'Login am BMC {server["ip"]} (JAR-Download)…')
-    http_sess, sid = _bmc_login(base, server['username'], server['password'])
+    sess.vnc_password = entry_value
+    sess.bmc_ip = server['ip']
+    # Use raw iteration to avoid CookieConflictError from duplicate-name cookies
+    sess.bmc_cookies = {c.name: c.value for c in http_sess.cookies}
 
-    # ── 5. Parse JNLP ─────────────────────────────────────────────────────────
-    msg('Analysiere JNLP…')
-    jars, native_jars, main_class, arguments = _parse_jnlp(jnlp_text, base)
-    if not main_class:
-        raise RuntimeError(
-            f'Keine main-class im JNLP. JNLP-Inhalt (Anfang): {jnlp_text[:300]}'
-        )
+    # ── 3. Start WebSocket proxy: ws://localhost:port_ws → wss://BMC:443/ ────
+    bmc_ws_uri = f"wss://{server['ip']}:443/"
+    stop_event = threading.Event()
+    sess._stop_event = stop_event  # type: ignore[attr-defined]
 
-    # ── 7. JARs herunterladen ─────────────────────────────────────────────────
-    cp_paths = []
-    for i, url in enumerate(jars, 1):
-        name = url.split('/')[-1].split('?')[0] or f'ikvm{i}.jar'
-        msg(f'Lade JAR {i}/{len(jars)}: {name}…')
-        dest = tmpdir / name
-        r = http_sess.get(url, timeout=30)
-        r.raise_for_status()
-        dest.write_bytes(r.content)
-        cp_paths.append(str(dest))
-
-    if not cp_paths:
-        raise RuntimeError('Keine JARs im JNLP gefunden')
-
-    # ── 8. Native JARs (*.so) extrahieren ─────────────────────────────────────
-    for url in native_jars:
-        name = url.split('/')[-1].split('?')[0] or 'native.jar'
-        msg(f'Lade Native-JAR: {name}…')
-        dest = tmpdir / name
-        r = http_sess.get(url, timeout=30)
-        r.raise_for_status()
-        dest.write_bytes(r.content)
-        try:
-            with zipfile.ZipFile(dest) as z:
-                for entry in z.namelist():
-                    if any(entry.endswith(ext) for ext in ('.so', '.dylib', '.dll')):
-                        z.extract(entry, path=str(tmpdir))
-        except Exception:
-            pass
-
-    # ── 9. Java starten ───────────────────────────────────────────────────────
-    msg(f'Starte Java ({main_class.split(".")[-1]})…')
-    env = os.environ.copy()
-    env['DISPLAY'] = disp
-
-    cmd = [
-        'java',
-        f'-Djava.library.path={tmpdir}',
-        '-Dawt.useSystemAAFontSettings=on',
-        '-Dswing.aatext=true',
-        '-Djava.awt.headless=false',
-        # For older JARs that use reflection internals (Java 9+ module guard)
-        '--add-opens=java.base/java.lang=ALL-UNNAMED',
-        '--add-opens=java.desktop/sun.awt=ALL-UNNAMED',
-        '--add-opens=java.desktop/java.awt=ALL-UNNAMED',
-        '-cp', ':'.join(cp_paths),
-        main_class,
-    ] + arguments
-
-    java = subprocess.Popen(
-        cmd, env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        cwd=str(tmpdir),
+    msg(f'Starte WebSocket-Proxy → {server["ip"]}:443 (Port {sess.port_ws})…')
+    proxy_thread = threading.Thread(
+        target=_run_ws_proxy,
+        args=(sess.port_ws, bmc_ws_uri, sess.bmc_cookies, stop_event),
+        daemon=True,
+        name=f'ws-proxy-{sess.session_id}',
     )
-    sess.procs.append(java)
+    proxy_thread.start()
+    time.sleep(0.5)
+    if not proxy_thread.is_alive():
+        raise RuntimeError('WebSocket-Proxy konnte nicht gestartet werden')
+
     sess.status  = 'running'
-    sess.message = f'Java läuft (PID {java.pid}) — iKVM wird geladen…'
+    sess.message = f'KVM bereit — HTML5-Proxy Port {sess.port_ws}'
 
-    # Wait for Java to exit, then auto-cleanup
-    java.wait()
-    sess.message = 'Java beendet'
-    stop_session(sess.session_id)
+    while proxy_thread.is_alive():
+        time.sleep(2)
+
+    raise RuntimeError('WebSocket-Proxy unerwartet beendet')
 
 
 def _kill(sess: 'KvmSession') -> None:
+    stop_ev = getattr(sess, '_stop_event', None)
+    if stop_ev is not None:
+        stop_ev.set()
     for p in reversed(sess.procs):
         try:
             p.terminate()

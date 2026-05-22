@@ -12,7 +12,7 @@ import requests as req_lib
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from flask import Flask, jsonify, request, send_from_directory, Response
+from flask import Flask, jsonify, redirect, request, send_from_directory, Response
 
 app = Flask(__name__)
 CONFIG_PATH = os.environ.get('CONFIG_PATH', '/config/servers.json')
@@ -838,6 +838,176 @@ def api_html5_kvm(server_id):
     return Response(page, content_type='text/html')
 
 
+@app.route('/api/servers/<server_id>/playwright-debug', methods=['GET'])
+def api_playwright_debug(server_id):
+    """Run Playwright and return a step-by-step report of what the BMC returns."""
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Server nicht gefunden'}), 404
+
+    base     = f"https://{server['ip']}"
+    username = server['username']
+    password = server['password']
+    steps    = []
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return jsonify({'error': 'Playwright nicht installiert'}), 500
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=['--no-sandbox','--disable-dev-shm-usage','--disable-gpu'],
+            )
+            ctx = browser.new_context(ignore_https_errors=True)
+            page = ctx.new_page()
+
+            # Step 1: Login
+            try:
+                r1 = page.goto(f"{base}/cgi/login.cgi",
+                               wait_until='domcontentloaded', timeout=15_000)
+                steps.append({'step':'1_load_login','url':r1.url,'status':r1.status,
+                               'cookies': [c['name']+'='+c['value'] for c in ctx.cookies()]})
+                page.locator('input[name="name"], input[name="username"]').first.fill(username, timeout=3_000)
+                page.locator('input[name="pwd"], input[name="password"]').first.fill(password, timeout=3_000)
+                # ATEN login button: id=login_word, onclick="checkform(this)" — NOT type=submit
+                page.locator(
+                    '#login_word, input[onclick*="checkform" i], '
+                    'input[value*="login" i], input[type="submit"], button[type="submit"]'
+                ).first.click(timeout=5_000)
+                page.wait_for_load_state('networkidle', timeout=12_000)
+                steps.append({'step':'2_after_login','url':page.url,
+                               'cookies': [c['name']+'='+c['value'] for c in ctx.cookies()]})
+            except Exception as e:
+                steps.append({'step':'login_error','error':str(e)})
+
+            # Step 2b: set nav cookies + inject SID into window before man_ikvm JS runs
+            bmc_host = server['ip']
+            sid_val = next((c['value'] for c in ctx.cookies() if c['name'] == 'SID'), '')
+            for cname, cval in [('mainpage','remote'),('subpage','man_ikvm')]:
+                ctx.add_cookies([{'name':cname,'value':cval,'domain':bmc_host,'path':'/'}])
+            # CRITICAL: ATEN's utils.js uses top.SID in XHR calls.
+            # When man_ikvm loads directly (no frameset), top.SID is undefined and
+            # GETPORTSINFO returns a redirect.  Inject SID before any page script runs.
+            ctx.add_init_script(
+                f"window.SID = '{sid_val}'; "
+                f"window.lang_setting = window.lang_setting || 'English';"
+            )
+            steps.append({'step':'2b_nav_cookies_set',
+                          'injected_SID': sid_val,
+                          'cookies': [c['name']+'='+c['value'] for c in ctx.cookies()]})
+
+            # Step 3: load man_ikvm (JS: pollServer → GetJNLPRequest)
+            try:
+                r2 = page.goto(f"{base}/cgi/url_redirect.cgi?url_name=man_ikvm",
+                               wait_until='domcontentloaded', timeout=15_000)
+                page.wait_for_timeout(3_500)   # wait for pollServer() JS
+                steps.append({'step':'3_man_ikvm','url':r2.url,'status':r2.status,
+                               'cookies': [c['name']+'='+c['value'] for c in ctx.cookies()],
+                               'page_title': page.title()})
+            except Exception as e:
+                steps.append({'step':'man_ikvm_error','error':str(e)})
+
+            # Step 4: POST GETPORTSINFO.XML via browser fetch (mirrors pollServer())
+            try:
+                result = page.evaluate(f"""async () => {{
+                    const r = await fetch({(base+'/cgi/ipmi.cgi')!r}, {{
+                        method: 'POST',
+                        credentials: 'include',
+                        headers: {{'Content-Type': 'application/x-www-form-urlencoded'}},
+                        body: 'op=GETPORTSINFO.XML&r=(0,0)'
+                    }});
+                    const t = await r.text();
+                    return {{status: r.status, body: t.substring(0,500)}};
+                }}""")
+                steps.append({'step':'4_GETPORTSINFO', **result})
+            except Exception as e:
+                steps.append({'step':'4_GETPORTSINFO_error','error':str(e)})
+
+            # Step 5: fetch url_name=ikvm via browser fetch() WITH correct cookies
+            jnlp_url = f"{base}/cgi/url_redirect.cgi?url_name=ikvm"
+            try:
+                result = page.evaluate(f"""async () => {{
+                    const r = await fetch({jnlp_url!r}, {{credentials:'include'}});
+                    const text = await r.text();
+                    return {{status: r.status, ct: r.headers.get('content-type'), body: text.substring(0,600)}};
+                }}""")
+                steps.append({'step':'5_fetch_ikvm', **result,
+                              'is_jnlp': '<jnlp' in (result.get('body') or '').lower()})
+            except Exception as e:
+                steps.append({'step':'5_fetch_ikvm_error','error':str(e)})
+
+            # Step 6: list buttons on current page
+            try:
+                btn_info = page.evaluate("""() => {
+                    const btns = Array.from(document.querySelectorAll('input[type=button],input[type=submit],button'));
+                    return btns.map(b => ({id:b.id, value:b.value||b.textContent.trim(),
+                                           onclick:b.getAttribute('onclick')||'',
+                                           disabled: b.disabled}));
+                }""")
+                steps.append({'step':'6_buttons_on_man_ikvm', 'buttons': btn_info[:10]})
+            except Exception as e:
+                steps.append({'step':'6_buttons_error','error':str(e)})
+
+            # Step 7: click Launch button then capture ikvm response
+            try:
+                el = page.locator('#Launch, input[value*="Launch" i], input[onclick*="JNLP" i]').first
+                if el.count() > 0:
+                    el.click(timeout=3_000)
+                    page.wait_for_timeout(2_000)
+                    # After click: fetch ikvm again
+                    result2 = page.evaluate(f"""async () => {{
+                        const r = await fetch({jnlp_url!r}, {{credentials:'include'}});
+                        const text = await r.text();
+                        return {{status: r.status, ct: r.headers.get('content-type'), body: text.substring(0,600)}};
+                    }}""")
+                    steps.append({'step':'7_after_click_fetch_ikvm', **result2,
+                                  'is_jnlp': '<jnlp' in (result2.get('body') or '').lower()})
+                else:
+                    steps.append({'step':'7_no_launch_button'})
+            except Exception as e:
+                steps.append({'step':'7_click_error','error':str(e)})
+
+            # Step 8: page.goto() directly to ikvm
+            try:
+                r3 = page.goto(jnlp_url, wait_until='commit', timeout=8_000)
+                body = r3.body().decode('utf-8', errors='replace') if r3 else ''
+                steps.append({'step':'8_goto_ikvm',
+                               'status': r3.status if r3 else None,
+                               'ct': r3.headers.get('content-type','') if r3 else '',
+                               'body_len': len(body),
+                               'body_preview': body[:600],
+                               'is_jnlp': '<jnlp' in body.lower()})
+            except Exception as e:
+                steps.append({'step':'8_goto_ikvm_error','error':str(e)})
+
+            browser.close()
+
+    except Exception as e:
+        steps.append({'step':'playwright_crash','error':str(e)})
+
+    import html as html_mod
+    rows = ''
+    for s in steps:
+        rows += f'<tr><th colspan="2" style="background:#21262d;padding:8px">{html_mod.escape(str(s.get("step","")))}</th></tr>'
+        for k, v in s.items():
+            if k == 'step': continue
+            rows += (f'<tr><td style="color:#8b949e;padding:4px 8px;white-space:nowrap">{html_mod.escape(str(k))}</td>'
+                     f'<td style="padding:4px 8px"><pre style="margin:0;white-space:pre-wrap;word-break:break-all">'
+                     f'{html_mod.escape(str(v))}</pre></td></tr>')
+    page_html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Playwright Debug</title>
+<style>body{{font-family:monospace;background:#0d1117;color:#e6edf3;padding:1rem}}
+table{{border-collapse:collapse;width:100%}}td,th{{border:1px solid #30363d;vertical-align:top}}
+pre{{background:#161b22;padding:6px;border-radius:4px;font-size:.8rem}}</style></head>
+<body><h2>Playwright Debug: {html_mod.escape(server['ip'])}</h2>
+<table>{rows}</table></body></html>"""
+    return Response(page_html, content_type='text/html')
+
+
 @app.route('/api/servers/<server_id>/jnlp-debug', methods=['GET'])
 def api_jnlp_debug(server_id):
     """Diagnostic endpoint — shows exactly what the BMC returns during login + JNLP fetch."""
@@ -1238,6 +1408,108 @@ def _jnlp_error(ip: str, message: str, debug_url: str = '') -> Response:
     return Response(html, content_type='text/html', status=502)
 
 
+# ── KVM HTML5 reverse-proxy ───────────────────────────────────────────────────────
+#
+# The BMC uses RFB 055.008 (ATEN proprietary) — only the BMC's own noVNC understands it.
+# We proxy the BMC's HTML5 bootstrap page through Flask, patch nav_ui.js to connect
+# to our local WebSocket proxy port instead of BMC:443 directly, and proxy all
+# static assets (JS/CSS/images) from the BMC with session cookies injected.
+
+@app.route('/kvm/<session_id>/view')
+def kvm_html5_view(session_id):
+    sess = _kvm.get_session(session_id) if _KVM_AVAILABLE else None
+    if not sess or sess.status == 'stopped':
+        return Response('<p>Session nicht gefunden</p>', status=404, content_type='text/html')
+
+    bmc_ip = getattr(sess, 'bmc_ip', '')
+    bmc_cookies = getattr(sess, 'bmc_cookies', {})
+
+    if not bmc_ip:
+        # Session still initialising — return auto-refresh page
+        return Response(
+            f'<html><head><meta http-equiv="refresh" content="1"></head>'
+            f'<body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;'
+            f'display:flex;align-items:center;justify-content:center;height:100vh;margin:0">'
+            f'<p>Initialisiere KVM-Session…</p></body></html>',
+            content_type='text/html',
+        )
+
+    s = req_lib.Session()
+    s.verify = False
+    s.headers.update(_BROWSER_HEADERS)
+    s.cookies.update(bmc_cookies)
+
+    try:
+        r = s.get(
+            f'https://{bmc_ip}/cgi/url_redirect.cgi?url_name=man_ikvm_html5_bootstrap',
+            timeout=10,
+        )
+        html = r.text
+    except Exception as e:
+        return Response(f'<p>Bootstrap-Seite nicht abrufbar: {e}</p>', status=502, content_type='text/html')
+
+    # Rewrite ../xxx relative URLs to go through our asset proxy
+    html = re.sub(
+        r'(src|href)="\.\./([^"]+)"',
+        lambda m: f'{m.group(1)}="/kvm/{session_id}/proxy/{m.group(2)}"',
+        html,
+    )
+
+    # Inject INCLUDE_URI so Util.load_scripts() fetches scripts through our proxy
+    include_inject = (
+        f'<script>var INCLUDE_URI = "/kvm/{session_id}/proxy/novnc/include/";</script>\n'
+    )
+    html = html.replace(
+        f'<script src="/kvm/{session_id}/proxy/novnc/include/util.js">',
+        f'{include_inject}<script src="/kvm/{session_id}/proxy/novnc/include/util.js">',
+        1,
+    )
+
+    return Response(html, content_type='text/html; charset=utf-8')
+
+
+@app.route('/kvm/<session_id>/proxy/<path:asset_path>')
+def kvm_proxy_asset(session_id, asset_path):
+    sess = _kvm.get_session(session_id) if _KVM_AVAILABLE else None
+    if not sess:
+        return Response('Session not found', status=404)
+
+    bmc_ip = getattr(sess, 'bmc_ip', '')
+    bmc_cookies = getattr(sess, 'bmc_cookies', {})
+    ws_port = sess.port_ws
+
+    s = req_lib.Session()
+    s.verify = False
+    s.headers.update(_BROWSER_HEADERS)
+    s.cookies.update(bmc_cookies)
+
+    try:
+        r = s.get(f'https://{bmc_ip}/{asset_path}', timeout=10)
+    except Exception as e:
+        return Response(f'Proxy error: {e}', status=502)
+
+    content = r.content
+    ct = r.headers.get('Content-Type', 'application/octet-stream')
+
+    # Patch nav_ui.js: hardcode our WebSocket proxy port and disable encryption
+    # (browser connects ws:// to our proxy; proxy forwards wss:// to BMC)
+    if asset_path.endswith('nav_ui.js'):
+        try:
+            text = content.decode('utf-8', errors='replace')
+            text = re.sub(
+                r'port=window\.location\.port;'
+                r'if\(window\.location\.protocol\.substring\(0,5\)=="https"\)\{[^}]*\}'
+                r'else if\(window\.location\.protocol\.substring\(0,4\)=="http"\)\{[^}]*\}',
+                f'port={ws_port};encrypt=false;',
+                text,
+            )
+            content = text.encode('utf-8')
+        except Exception:
+            pass
+
+    return Response(content, content_type=ct)
+
+
 # ── KVM Browser Sessions ─────────────────────────────────────────────────────────
 
 @app.route('/api/servers/<server_id>/kvm-session', methods=['POST'])
@@ -1273,7 +1545,7 @@ def api_kvm_start(server_id):
 
 @app.route('/api/servers/<server_id>/kvm-viewer', methods=['GET'])
 def api_kvm_viewer(server_id):
-    """Serve an embedded noVNC viewer page for the active KVM session."""
+    """Redirect to the proxied BMC HTML5 KVM viewer for the active session."""
     sess = _kvm.get_session_for_server(server_id) if _KVM_AVAILABLE else None
     if not sess or sess.status not in ('running', 'starting'):
         return Response(
@@ -1282,22 +1554,7 @@ def api_kvm_viewer(server_id):
             '<p>Keine aktive KVM-Session</p></body></html>',
             content_type='text/html',
         )
-    host = request.host.split(':')[0]
-    ws_port = sess.port_ws
-    page = f"""<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="UTF-8">
-  <style>* {{ margin:0; padding:0; box-sizing:border-box }}
-    body {{ background:#000; overflow:hidden }}
-    iframe {{ width:100vw; height:100vh; border:none; display:block }}</style>
-</head>
-<body>
-  <iframe src="/novnc/vnc.html?host={host}&port={ws_port}&autoconnect=true&encrypt=false&resize=scale&logging=warn"
-          allow="fullscreen"></iframe>
-</body>
-</html>"""
-    return Response(page, content_type='text/html')
+    return redirect(f'/kvm/{sess.session_id}/view')
 
 
 @app.route('/api/servers/<server_id>/kvm-session', methods=['GET'])

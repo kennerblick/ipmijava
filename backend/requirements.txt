@@ -3,3 +3,4 @@ gunicorn==22.0.0
 requests==2.32.3
 urllib3==2.2.3
 playwright==1.44.0
+websockets>=16.0
