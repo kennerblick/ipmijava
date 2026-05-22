@@ -7,6 +7,7 @@ const state = {
   statuses: {},        // { [serverId]: { online, power, loading } }
   selectedGroup: null,
   pollTimer: null,
+  lastScanIps: [],
 };
 
 // ── API helpers ──────────────────────────────────────────────────────────────
@@ -340,6 +341,16 @@ async function deleteGroup(id) {
 
 // ── Server CRUD ───────────────────────────────────────────────────────────────
 
+function _setGroupSelectRow(visible, currentGroupId) {
+  const row = document.getElementById('server-group-select-row');
+  row.classList.toggle('d-none', !visible);
+  if (!visible) return;
+  const sel = document.getElementById('server-group-select');
+  sel.innerHTML = state.groups.map(g =>
+    `<option value="${esc(g.id)}"${g.id === currentGroupId ? ' selected' : ''}>${esc(g.name)}</option>`
+  ).join('');
+}
+
 function showAddServerModal(groupId) {
   document.getElementById('server-id-input').value   = '';
   document.getElementById('server-group-id').value   = groupId;
@@ -349,6 +360,7 @@ function showAddServerModal(groupId) {
   document.getElementById('server-user-input').value = 'ADMIN';
   document.getElementById('server-pass-input').value = '';
   document.getElementById('server-desc-input').value = '';
+  _setGroupSelectRow(false, groupId);
   new bootstrap.Modal(document.getElementById('serverModal')).show();
   setTimeout(() => document.getElementById('server-name-input').focus(), 300);
 }
@@ -368,12 +380,15 @@ function editServer(serverId, groupId) {
   document.getElementById('server-user-input').value = srv.username;
   document.getElementById('server-pass-input').value = srv.password;
   document.getElementById('server-desc-input').value = srv.description || '';
+  _setGroupSelectRow(true, groupId);
   new bootstrap.Modal(document.getElementById('serverModal')).show();
 }
 
 async function saveServer() {
-  const id      = document.getElementById('server-id-input').value;
-  const groupId = document.getElementById('server-group-id').value;
+  const id             = document.getElementById('server-id-input').value;
+  const origGroupId    = document.getElementById('server-group-id').value;
+  const selectedGroup  = document.getElementById('server-group-select');
+  const targetGroupId  = (id && !selectedGroup.closest('.d-none')) ? selectedGroup.value : origGroupId;
   const data = {
     name:        document.getElementById('server-name-input').value.trim(),
     ip:          document.getElementById('server-ip-input').value.trim(),
@@ -382,9 +397,10 @@ async function saveServer() {
     description: document.getElementById('server-desc-input').value.trim(),
   };
   if (!data.name || !data.ip) { alert('Name und IP erforderlich'); return; }
+  if (id && targetGroupId !== origGroupId) data.group_id = targetGroupId;
   try {
     if (id) { await apiPut(`/servers/${id}`, data); }
-    else    { await apiPost(`/groups/${groupId}/servers`, data); }
+    else    { await apiPost(`/groups/${origGroupId}/servers`, data); }
     bootstrap.Modal.getInstance(document.getElementById('serverModal')).hide();
     await loadGroups();
   } catch (e) {
@@ -408,6 +424,8 @@ async function deleteServer(id) {
 function showScanModal() {
   document.getElementById('scan-network-input').value = '';
   document.getElementById('scan-results').innerHTML   = '';
+  document.getElementById('scan-import-all-btn').classList.add('d-none');
+  state.lastScanIps = [];
   const btn = document.getElementById('scan-btn');
   btn.disabled = false;
   btn.innerHTML = '<i class="bi bi-radar"></i> Scannen';
@@ -439,7 +457,11 @@ async function startScan() {
 
 function renderScanResults({ found, total, method }) {
   const el = document.getElementById('scan-results');
+  const importBtn = document.getElementById('scan-import-all-btn');
   const methodLabel = method === 'nmap' ? 'nmap' : 'Socket-Scan';
+
+  state.lastScanIps = found || [];
+  importBtn.classList.toggle('d-none', state.lastScanIps.length === 0);
 
   if (!found || found.length === 0) {
     el.innerHTML = `
@@ -463,6 +485,27 @@ function renderScanResults({ found, total, method }) {
       ${found.length} Gerät(e) gefunden von ${total} Hosts (${methodLabel})
     </div>
     ${rows}`;
+}
+
+async function importAllFromScan() {
+  if (state.lastScanIps.length === 0) return;
+  const btn = document.getElementById('scan-import-all-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Importiere…';
+  try {
+    const r = await apiPost('/scan/import', { ips: state.lastScanIps });
+    bootstrap.Modal.getInstance(document.getElementById('scanModal')).hide();
+    await loadGroups();
+    showToast(
+      `${r.created} Server importiert${r.skipped ? `, ${r.skipped} bereits vorhanden` : ''} → Gruppe "Ungruppiert"`,
+      'success'
+    );
+  } catch (e) {
+    showToast(`Fehler beim Import: ${e.message}`, 'danger');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-cloud-download"></i> Alle importieren';
+  }
 }
 
 function prefillFromScan(ip) {

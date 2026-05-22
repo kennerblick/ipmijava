@@ -83,6 +83,10 @@
         <div class="modal-body">
           <input type="hidden" id="server-id-input">
           <input type="hidden" id="server-group-id">
+          <div class="mb-3 d-none" id="server-group-select-row">
+            <label class="form-label">Gruppe</label>
+            <select class="form-select" id="server-group-select"></select>
+          </div>
           <div class="mb-3">
             <label class="form-label">Name <span class="text-danger">*</span></label>
             <input type="text" class="form-control" id="server-name-input" placeholder="z.B. SRV-PROD-01">
@@ -144,6 +148,10 @@
           <div id="scan-results"></div>
         </div>
         <div class="modal-footer">
+          <button type="button" class="btn btn-success d-none" id="scan-import-all-btn"
+                  onclick="importAllFromScan()">
+            <i class="bi bi-cloud-download"></i> Alle importieren
+          </button>
           <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Schließen</button>
         </div>
       </div>

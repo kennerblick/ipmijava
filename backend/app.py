@@ -168,13 +168,19 @@ def api_create_server(group_id):
 @app.route('/api/servers/<server_id>', methods=['PUT'])
 def api_update_server(server_id):
     config = load_config()
-    server, _ = find_server(config, server_id)
+    server, group = find_server(config, server_id)
     if not server:
         return jsonify({'error': 'Nicht gefunden'}), 404
     d = request.json or {}
     for key in ('name', 'ip', 'username', 'password', 'description'):
         if key in d:
             server[key] = d[key].strip() if isinstance(d[key], str) else d[key]
+    new_group_id = d.get('group_id')
+    if new_group_id and new_group_id != group['id']:
+        target = next((g for g in config['groups'] if g['id'] == new_group_id), None)
+        if target:
+            group['servers'] = [s for s in group['servers'] if s['id'] != server_id]
+            target['servers'].append(server)
     save_config(config)
     return jsonify(server)
 
@@ -186,6 +192,33 @@ def api_delete_server(server_id):
         g['servers'] = [s for s in g['servers'] if s['id'] != server_id]
     save_config(config)
     return '', 204
+
+
+@app.route('/api/scan/import', methods=['POST'])
+def api_scan_import():
+    config = load_config()
+    ips = (request.json or {}).get('ips', [])
+    if not ips:
+        return jsonify({'error': 'Keine IPs angegeben'}), 400
+    ungrouped = next((g for g in config['groups'] if g.get('ungrouped')), None)
+    if not ungrouped:
+        ungrouped = {'id': str(uuid.uuid4()), 'name': 'Ungruppiert', 'ungrouped': True, 'servers': []}
+        config['groups'].append(ungrouped)
+    existing_ips = {s['ip'] for g in config['groups'] for s in g['servers']}
+    created = 0
+    for ip in ips:
+        if ip not in existing_ips:
+            ungrouped['servers'].append({
+                'id': str(uuid.uuid4()),
+                'name': f"BMC-{ip.split('.')[-1]}",
+                'ip': ip,
+                'username': 'ADMIN',
+                'password': '',
+                'description': '',
+            })
+            created += 1
+    save_config(config)
+    return jsonify({'created': created, 'skipped': len(ips) - created, 'group_id': ungrouped['id']}), 201
 
 
 # ── Status & Power ──────────────────────────────────────────────────────────────
