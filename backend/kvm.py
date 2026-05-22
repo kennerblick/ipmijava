@@ -586,12 +586,19 @@ def _run_ws_proxy(local_port: int, bmc_uri: str, cookies: dict,
         except Exception:
             pass
 
+    def select_subprotocol(connection, protocols):
+        if 'binary' in protocols:
+            return 'binary'
+        if protocols:
+            return protocols[0]
+        return None  # accept connections without subprotocol too
+
     async def main():
         async with websockets.serve(
             proxy_handler,
             '0.0.0.0',
             local_port,
-            subprotocols=['binary', 'base64'],
+            select_subprotocol=select_subprotocol,
             ping_interval=None,
             max_size=None,
             compression=None,
