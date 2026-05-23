@@ -31,12 +31,14 @@ if ($existing -notmatch [regex]::Escape($site)) {
 
 # --- 3. deployment.properties aktualisieren
 $needed = @{
-    'deployment.security.level'                     = 'MEDIUM'
+    'deployment.security.level'                     = 'LOW'
     'deployment.security.validation.crl'            = 'false'
     'deployment.security.validation.ocsp'           = 'false'
     'deployment.security.expired.warning'           = 'false'
     'deployment.security.jsse.hostmismatch.warning' = 'false'
     'deployment.manifest.attributes.check'          = 'false'
+    'deployment.security.mixcode'                   = 'DISABLE'
+    'deployment.security.sandbox.awtwarningwindow'  = 'false'
 }
 
 if (Test-Path $propsFile) {
@@ -61,38 +63,40 @@ foreach ($key in $needed.Keys) {
 
 $lines | Set-Content $propsFile -Encoding UTF8
 
-# --- 4. SHA1 in java.security entsperren
-#  Entfernt SHA1-Tokens aus jdk.jar.disabledAlgorithms und
-#  jdk.certpath.disabledAlgorithms (inkl. Fortsetzungszeilen mit \).
+# --- 4. Legacy-Crypto-Beschraenkungen in java.security entfernen
+#  Entfernt alle schwachen Algorithmen aus jdk.jar.disabledAlgorithms,
+#  jdk.certpath.disabledAlgorithms und jdk.tls.disabledAlgorithms
+#  (behaelt nur MD2 als absolutes Minimum).
 
-function Remove-SHA1Restrictions {
+function Remove-CryptoRestrictions {
     param([string]$Path)
     $fileLines = [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
     $out       = [System.Collections.Generic.List[string]]::new()
     $changed   = $false
-    $skipCont  = $false
+
+    $props = @('jdk.jar.disabledAlgorithms','jdk.certpath.disabledAlgorithms','jdk.tls.disabledAlgorithms')
 
     for ($i = 0; $i -lt $fileLines.Count; $i++) {
         $line = $fileLines[$i]
-        if ($skipCont) {
-            $changed = $true
-            if (-not $line.TrimEnd().EndsWith('\')) { $skipCont = $false }
-            continue
-        }
-        if ($line -match '^(jdk\.jar\.disabledAlgorithms|jdk\.certpath\.disabledAlgorithms)\s*=') {
-            $propName = $Matches[1]
-            $val = ($line -replace '^[^=]+=\s*', '').TrimEnd('\').Trim()
-            while ($line.TrimEnd().EndsWith('\') -and ($i + 1) -lt $fileLines.Count) {
-                $i++
-                $line = $fileLines[$i]
-                $val += ',' + $line.TrimEnd('\').Trim()
+        $matched = $false
+        foreach ($propName in $props) {
+            if ($line -match "^$([regex]::Escape($propName))\s*=") {
+                # Collect multi-line value
+                $val = ($line -replace '^[^=]+=\s*', '').TrimEnd('\').Trim()
+                while ($line.TrimEnd().EndsWith('\') -and ($i + 1) -lt $fileLines.Count) {
+                    $i++
+                    $line = $fileLines[$i]
+                    $val += ',' + $line.TrimEnd('\').Trim()
+                }
+                # Keep only MD2 (truly broken); remove all other restrictions
+                $parts = ($val -split ',') | Where-Object { $_.Trim() -match '^MD2\b' }
+                $out.Add("$propName=" + ($parts -join ', '))
+                $changed = $true
+                $matched = $true
+                break
             }
-            $parts = ($val -split ',') | Where-Object { $_.Trim() -notmatch '^SHA1' }
-            $out.Add("$propName=" + ($parts -join ', '))
-            $changed = $true
-        } else {
-            $out.Add($line)
         }
+        if (-not $matched) { $out.Add($line) }
     }
     if ($changed) {
         [System.IO.File]::WriteAllText($Path, ($out -join "`r`n"), [System.Text.Encoding]::UTF8)
@@ -105,14 +109,15 @@ $userSecDir  = "$env:APPDATA\Sun\Java\Deployment\security"
 $userSecFile = "$userSecDir\java.security"
 New-Item -ItemType Directory -Force -Path $userSecDir | Out-Null
 if (-not (Test-Path $userSecFile)) {
-    $minContent = "# iKVM SHA1-Fix`r`n" +
-                  "jdk.jar.disabledAlgorithms=MD2, MD5, RSA keySize < 1024, DSA keySize < 1024`r`n" +
-                  "jdk.certpath.disabledAlgorithms=MD2, MD5, DSA keySize < 1024, RSA keySize < 1024`r`n"
+    $minContent = "# iKVM Crypto-Fix (niedrigste Sicherheitsstufe)`r`n" +
+                  "jdk.jar.disabledAlgorithms=MD2`r`n" +
+                  "jdk.certpath.disabledAlgorithms=MD2`r`n" +
+                  "jdk.tls.disabledAlgorithms=MD2`r`n"
     [System.IO.File]::WriteAllText($userSecFile, $minContent, [System.Text.Encoding]::UTF8)
     Write-Host "  [OK] Per-user java.security angelegt: $userSecFile" -ForegroundColor Green
 } else {
-    if (Remove-SHA1Restrictions $userSecFile) {
-        Write-Host "  [OK] SHA1-Restrictions entfernt: $userSecFile" -ForegroundColor Green
+    if (Remove-CryptoRestrictions $userSecFile) {
+        Write-Host "  [OK] Crypto-Restrictions entfernt: $userSecFile" -ForegroundColor Green
     } else {
         Write-Host "  [--] Per-user java.security bereits bereinigt" -ForegroundColor Yellow
     }
@@ -137,8 +142,8 @@ foreach ($jh in $javaHomes) {
     Write-Host "  Versuche JRE-Datei: $sec"
     try {
         Copy-Item $sec "$sec.bak" -Force -ErrorAction Stop
-        if (Remove-SHA1Restrictions $sec) {
-            Write-Host "  [OK] SHA1-Einschraenkungen entfernt (Backup: $sec.bak)" -ForegroundColor Green
+        if (Remove-CryptoRestrictions $sec) {
+            Write-Host "  [OK] Crypto-Einschraenkungen entfernt (Backup: $sec.bak)" -ForegroundColor Green
             $patched = $true
         } else {
             Write-Host "  [--] Keine SHA1-Einschraenkungen in JRE-Datei" -ForegroundColor Yellow

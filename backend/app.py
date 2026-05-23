@@ -444,6 +444,9 @@ _JNLP_PATHS = [
     '/cgi/ikvm.cgi',
     '/cgi/ikvm',
     '/cgi/launchKVM.cgi',
+    # AMI MegaRAC / GoAhead (B04ND, Supermicro X8/X9 with AMI firmware)
+    '/Java/jviewer.jnlp',
+    '/Java/JViewer.jnlp',
     # Root-level JNLP (codebase in JNLP is root "/", file named "launch.jnlp")
     '/launch.jnlp',
     '/iKVM.jnlp',
@@ -517,12 +520,16 @@ def _bmc_login(base: str, username: str, password: str) -> tuple[req_lib.Session
 
     if sid:
         sess.cookies.set('SID', sid)
+        # Simulate browser navigation: ATEN's url_redirect.cgi?url_name=ikvm
+        # checks internal session state that is only set after visiting topmenu.
+        _bmc_navigate_to_kvm(sess, base)
+        return sess, sid
 
-    # Simulate browser navigation: ATEN's url_redirect.cgi?url_name=ikvm
-    # checks internal session state that is only set after visiting topmenu.
-    # Also sets mainpage/subpage cookies needed for the KVM section.
-    _bmc_navigate_to_kvm(sess, base)
-
+    # ATEN login yielded no SID — try GoAhead (AMI MegaRAC) firmware
+    sid = _bmc_login_goahead(sess, base, username, password)
+    if sid:
+        sess.cookies.set('SID', sid)
+        sess.cookies.set('SessionCookie', sid)  # GoAhead uses this cookie name
     return sess, sid
 
 
@@ -597,6 +604,55 @@ def _extract_sid_from_body(text: str) -> str | None:
     return None
 
 
+def _bmc_login_goahead(sess: req_lib.Session, base: str, username: str, password: str) -> str | None:
+    """AMI MegaRAC / GoAhead BMC login via /rpc/WEBSES/create.asp.
+
+    Returns the SESSION_COOKIE token, or None on failure.
+    """
+    try:
+        r = sess.post(
+            f"{base}/rpc/WEBSES/create.asp",
+            data={'WEBVAR_USERNAME': username, 'WEBVAR_PASSWORD': password},
+            timeout=10,
+        )
+        m = re.search(r"""['"]SESSION_COOKIE['"]\s*:\s*['"]([^'"]+)['"]""", r.text)
+        if m:
+            return m.group(1)
+    except Exception:
+        pass
+    return None
+
+
+def _read_response_body(r: req_lib.Response) -> bytes:
+    """Read response body, tolerating servers that lie about Content-Length.
+
+    GoAhead (AMI MegaRAC) sends Content-Length: 3757 but closes after ~2013 bytes.
+    Setting fp.length=None on the underlying http.client response bypasses the check.
+    """
+    fp = getattr(r.raw, '_fp', None)
+    if fp is not None:
+        orig_len = getattr(fp, 'length', None)
+        try:
+            fp.length = None
+            body = fp.read()
+            return body if body else b''
+        except Exception as exc:
+            partial = getattr(exc, 'partial', b'')
+            return partial if partial else b''
+        finally:
+            try:
+                fp.length = orig_len
+            except Exception:
+                pass
+    body = b''
+    try:
+        for chunk in r.iter_content(8192):
+            body += chunk
+    except Exception:
+        pass
+    return body
+
+
 def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Response | None:
     """Try all known JNLP paths, then scrape navigation pages for firmware-specific URLs."""
     # Referer mimics the browser being on the Console Redirection page (man_ikvm),
@@ -612,8 +668,10 @@ def _fetch_jnlp(sess: req_lib.Session, base: str, sid: str | None) -> req_lib.Re
 
     for url in candidates:
         try:
-            r = sess.get(url, timeout=8, headers=jnlp_headers)
-            if '<jnlp' in r.text.lower():
+            r = sess.get(url, timeout=8, headers=jnlp_headers, stream=True)
+            body = _read_response_body(r)
+            r._content = body
+            if b'<jnlp' in body.lower():
                 return r
         except Exception:
             continue
@@ -699,11 +757,46 @@ def api_console_jnlp(server_id):
     if not server:
         return jsonify({'error': 'Server nicht gefunden'}), 404
 
+    base = f"https://{server['ip']}"
+
+    # GoAhead (AMI MegaRAC) detection: ATEN login returns 405 → use GoAhead path.
+    # GoAhead login yields SESSION_COOKIE in response body; JNLP must be fetched
+    # server-side because the browser cannot set cookies via response body.
+    try:
+        _test_r = req_lib.Session()
+        _test_r.verify = False
+        _aten_chk = _test_r.post(f"{base}/cgi/login.cgi",
+            data={'name': server['username'], 'pwd': server['password']},
+            timeout=6, allow_redirects=False)
+        _is_goahead = (_aten_chk.status_code == 405)
+    except Exception:
+        _is_goahead = False
+
+    if _is_goahead:
+        go_sid = _bmc_login_goahead(_test_r, base, server['username'], server['password'])
+        if go_sid:
+            _test_r.cookies.set('SessionCookie', go_sid)
+            # Try GoAhead-specific JNLP paths directly (skip slow ATEN path scan)
+            for _gpath in ('/Java/jviewer.jnlp', '/Java/JViewer.jnlp'):
+                try:
+                    _gr = _test_r.get(f"{base}{_gpath}", timeout=10, stream=True)
+                    _gbody = _read_response_body(_gr)
+                    if b'<jnlp' in _gbody.lower():
+                        ip_safe = re.sub(r'[^a-zA-Z0-9]', '_', server['ip'])
+                        return Response(
+                            _gbody,
+                            content_type='application/x-java-jnlp-file',
+                            headers={'Content-Disposition': f'attachment; filename="jviewer-{ip_safe}.jnlp"'},
+                        )
+                except Exception:
+                    continue
+        return jsonify({'error': 'GoAhead JNLP-Abruf fehlgeschlagen'}), 503
+
     import html as html_mod
     ip          = html_mod.escape(server['ip'])
     username    = html_mod.escape(server['username'])
     password    = html_mod.escape(server['password'])
-    bmc_base    = f"https://{server['ip']}"
+    bmc_base    = base
     login_url   = f"{bmc_base}/cgi/login.cgi"
     console_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm"
 
