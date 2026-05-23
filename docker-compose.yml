@@ -11,6 +11,8 @@ services:
       - "9193:9193"
       - "6080-6089:6080-6089"   # websockify HTML5 KVM sessions
       - "6090-6099:6090-6099"   # TCP proxy Java iKVM sessions
+    environment:
+      SECRET_KEY: "12c658c55b1d42896ce9794bb17dd9de90e544a14f7f11902e109c5e67a6ef1d"
     volumes:
       - ./config:/config
     restart: unless-stopped
