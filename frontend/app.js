@@ -8,6 +8,7 @@ const state = {
   selectedGroup: null,
   pollTimer: null,
   lastScanIps: [],
+  auth: { username: null, is_ipmi_user: false },
 };
 
 // ── API helpers ──────────────────────────────────────────────────────────────
@@ -20,6 +21,10 @@ async function apiFetch(method, path, body) {
   }
   const r = await fetch(API + path, opts);
   if (r.status === 204) return null;
+  if (r.status === 403) {
+    showLoginModal();
+    throw new Error('Nicht autorisiert — bitte anmelden');
+  }
   const data = await r.json();
   if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
   return data;
@@ -90,21 +95,24 @@ function renderSidebar() {
     el.innerHTML = '<p class="text-muted small px-1 mt-2">Noch keine Gruppen.<br>Oben "+ Gruppe" klicken.</p>';
     return;
   }
+  const ipmi = state.auth.is_ipmi_user;
   el.innerHTML = state.groups.map(g => {
     const active = state.selectedGroup === g.id ? ' active' : '';
     const count  = g.servers.length;
+    const editDel = ipmi ? `
+          <button class="sb-btn" onclick="event.stopPropagation();editGroup('${g.id}')" title="Umbenennen">
+            <i class="bi bi-pencil"></i>
+          </button>
+          <button class="sb-btn text-danger" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="Löschen">
+            <i class="bi bi-trash"></i>
+          </button>` : '';
     return `
       <div class="sidebar-group${active}">
         <div class="sidebar-row" onclick="selectGroup('${g.id}')">
           <i class="bi bi-server text-secondary"></i>
           <span class="flex-grow-1 text-truncate">${esc(g.name)}</span>
           <span class="badge bg-secondary">${count}</span>
-          <button class="sb-btn" onclick="event.stopPropagation();editGroup('${g.id}')" title="Umbenennen">
-            <i class="bi bi-pencil"></i>
-          </button>
-          <button class="sb-btn text-danger" onclick="event.stopPropagation();deleteGroup('${g.id}')" title="Löschen">
-            <i class="bi bi-trash"></i>
-          </button>
+          ${editDel}
         </div>
       </div>`;
   }).join('');
@@ -134,13 +142,14 @@ function renderGrid() {
     return;
   }
 
+  const canEdit = state.auth.is_ipmi_user;
   el.innerHTML = groups.map(g => `
     <div class="mb-5" id="group-section-${g.id}">
       <div class="d-flex align-items-center gap-2 mb-3">
         <h5 class="mb-0">${esc(g.name)}</h5>
-        <button class="btn btn-sm btn-outline-primary" onclick="showAddServerModal('${g.id}')">
+        ${canEdit ? `<button class="btn btn-sm btn-outline-primary" onclick="showAddServerModal('${g.id}')">
           <i class="bi bi-plus-lg"></i> Server
-        </button>
+        </button>` : ''}
       </div>
       <div class="row g-3" id="group-grid-${g.id}">
         ${g.servers.length === 0
@@ -172,7 +181,8 @@ function serverCardHtml(server, status, groupId) {
       ? `<span class="badge bg-warning text-dark ms-1">AUS</span>`
       : '';
 
-  const dis = (!online || loading) ? ' disabled' : '';
+  const dis   = (!online || loading) ? ' disabled' : '';
+  const ipmi  = state.auth.is_ipmi_user;
 
   // caps === undefined  →  not yet probed, show all
   // caps defined        →  show only supported features
@@ -180,7 +190,7 @@ function serverCardHtml(server, status, groupId) {
   const showKvm     = !caps || caps.kvm_aten;
   const showConsole = !caps || caps.kvm_aten || caps.ikvm_java || caps.bmc_http;
 
-  const powerGroup = showIpmi ? `
+  const powerGroup = ipmi && showIpmi ? `
           <div class="btn-group btn-group-sm mt-auto" role="group">
             <button class="btn btn-success${dis}" onclick="powerAction('${server.id}','on')" title="Power ON">
               <i class="bi bi-power"></i> ON
@@ -197,14 +207,23 @@ function serverCardHtml(server, status, groupId) {
             <button class="btn btn-outline-danger${dis}" onclick="powerAction('${server.id}','cycle')" title="Power Cycle (Hard Reset)">
               <i class="bi bi-lightning-charge-fill"></i>
             </button>
-          </div>` : `
-          <div class="mt-auto">
-            <span class="badge bg-secondary text-muted small">Kein IPMI</span>
-          </div>`;
+          </div>` : '';
 
-  const probeBtn = probing
-    ? `<button class="btn btn-sm btn-outline-warning disabled" title="Erkenne Funktionen…"><span class="spinner-border spinner-border-sm" style="width:.65rem;height:.65rem;"></span></button>`
-    : `<button class="btn btn-sm btn-outline-secondary" onclick="probeServer('${server.id}')" title="Funktionen neu erkennen"><i class="bi bi-cpu"></i></button>`;
+  const probeBtn = ipmi
+    ? (probing
+        ? `<button class="btn btn-sm btn-outline-warning disabled" title="Erkenne Funktionen…"><span class="spinner-border spinner-border-sm" style="width:.65rem;height:.65rem;"></span></button>`
+        : `<button class="btn btn-sm btn-outline-secondary" onclick="probeServer('${server.id}')" title="Funktionen neu erkennen"><i class="bi bi-cpu"></i></button>`)
+    : '';
+
+  const actionBtns = ipmi ? `
+            ${showKvm     ? `<button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="HTML5 KVM (Browser-Konsole)"><i class="bi bi-display"></i></button>` : ''}
+            ${showConsole ? `<button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Konsolen-Optionen"><i class="bi bi-window"></i></button>` : ''}
+            <button class="btn btn-sm btn-outline-secondary" onclick="fetchStatus('${server.id}')" title="Status aktualisieren"><i class="bi bi-arrow-clockwise"></i></button>
+            ${probeBtn}
+            <button class="btn btn-sm btn-outline-secondary" onclick="editServer('${server.id}','${groupId}')" title="Bearbeiten"><i class="bi bi-pencil"></i></button>
+            <button class="btn btn-sm btn-outline-danger" onclick="deleteServer('${server.id}')" title="Löschen"><i class="bi bi-trash"></i></button>` : `
+            <button class="btn btn-sm btn-outline-secondary" onclick="fetchStatus('${server.id}')" title="Status aktualisieren"><i class="bi bi-arrow-clockwise"></i></button>
+            <button class="btn btn-sm btn-outline-secondary disabled" title="Anmelden für Aktionen"><i class="bi bi-lock"></i></button>`;
 
   return `
     <div class="col-xxl-3 col-xl-4 col-lg-6 col-md-6" id="card-wrap-${server.id}">
@@ -220,19 +239,8 @@ function serverCardHtml(server, status, groupId) {
           </div>
           ${powerGroup}
           <!-- Secondary actions -->
-          <div class="d-flex gap-1 flex-wrap">
-            ${showKvm     ? `<button class="btn btn-sm btn-outline-info" onclick="openKvm('${server.id}')" title="HTML5 KVM (Browser-Konsole)"><i class="bi bi-display"></i></button>` : ''}
-            ${showConsole ? `<button class="btn btn-sm btn-outline-secondary" onclick="openConsole('${server.id}')" title="Konsolen-Optionen"><i class="bi bi-window"></i></button>` : ''}
-            <button class="btn btn-sm btn-outline-secondary" onclick="fetchStatus('${server.id}')" title="Status aktualisieren">
-              <i class="bi bi-arrow-clockwise"></i>
-            </button>
-            ${probeBtn}
-            <button class="btn btn-sm btn-outline-secondary" onclick="editServer('${server.id}','${groupId}')" title="Bearbeiten">
-              <i class="bi bi-pencil"></i>
-            </button>
-            <button class="btn btn-sm btn-outline-danger" onclick="deleteServer('${server.id}')" title="Löschen">
-              <i class="bi bi-trash"></i>
-            </button>
+          <div class="d-flex gap-1 flex-wrap mt-auto">
+            ${actionBtns}
           </div>
         </div>
       </div>
@@ -715,6 +723,116 @@ function closeKvm() {
 }
 
 
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+async function loadAuth() {
+  try {
+    const me = await fetch(API + '/me').then(r => r.json());
+    state.auth = { username: me.username, is_ipmi_user: me.is_ipmi_user };
+  } catch {
+    state.auth = { username: null, is_ipmi_user: false };
+  }
+  _updateAuthUI();
+}
+
+function _updateAuthUI() {
+  const nav   = document.getElementById('auth-nav');
+  const scanB = document.getElementById('nav-scan-btn');
+  const grpB  = document.getElementById('nav-gruppe-btn');
+  const ipmi  = state.auth.is_ipmi_user;
+
+  scanB.classList.toggle('d-none', !ipmi);
+  grpB.classList.toggle('d-none',  !ipmi);
+
+  if (state.auth.username) {
+    const roleTag = ipmi
+      ? `<span class="badge bg-success ms-1" title="Mitglied der IPMIUser-Gruppe">IPMIUser</span>`
+      : `<span class="badge bg-secondary ms-1" title="Kein Mitglied der IPMIUser-Gruppe">Lesezugriff</span>`;
+    nav.innerHTML = `
+      <span class="text-muted small d-flex align-items-center gap-1">
+        <i class="bi bi-person-check text-success"></i>${esc(state.auth.username)}${roleTag}
+      </span>
+      <button class="btn btn-sm btn-outline-secondary" onclick="doLogout()" title="Abmelden">
+        <i class="bi bi-box-arrow-right"></i>
+      </button>`;
+  } else {
+    nav.innerHTML = `
+      <button class="btn btn-sm btn-outline-primary" onclick="showLoginModal()">
+        <i class="bi bi-person me-1"></i>Anmelden
+      </button>`;
+  }
+
+  // Re-render cards so action buttons appear/disappear
+  renderSidebar();
+  renderGrid();
+}
+
+function showLoginModal() {
+  document.getElementById('login-user-input').value = '';
+  document.getElementById('login-pass-input').value = '';
+  document.getElementById('login-error').classList.add('d-none');
+  document.getElementById('login-btn').disabled = false;
+  document.getElementById('login-btn').innerHTML = '<i class="bi bi-box-arrow-in-right me-1"></i>Anmelden';
+  const m = new bootstrap.Modal(document.getElementById('loginModal'));
+  m.show();
+  setTimeout(() => document.getElementById('login-user-input').focus(), 300);
+}
+
+async function doLogin() {
+  const username = document.getElementById('login-user-input').value.trim();
+  const password = document.getElementById('login-pass-input').value;
+  const errEl    = document.getElementById('login-error');
+  const btn      = document.getElementById('login-btn');
+
+  errEl.classList.add('d-none');
+  if (!username || !password) {
+    errEl.textContent = 'Benutzername und Passwort erforderlich';
+    errEl.classList.remove('d-none');
+    return;
+  }
+
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner-border spinner-border-sm me-1"></span>Prüfe…';
+
+  try {
+    const me = await fetch(API + '/login', {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ username, password }),
+    }).then(async r => {
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `HTTP ${r.status}`);
+      return d;
+    });
+    state.auth = { username: me.username, is_ipmi_user: me.is_ipmi_user };
+    bootstrap.Modal.getInstance(document.getElementById('loginModal')).hide();
+    _updateAuthUI();
+    if (!me.is_ipmi_user) {
+      showToast(`Angemeldet als ${me.username} — kein Mitglied der IPMIUser-Gruppe, nur Lesezugriff`, 'warning');
+    } else {
+      showToast(`Angemeldet als ${me.username}`, 'success');
+    }
+  } catch (e) {
+    errEl.textContent = e.message;
+    errEl.classList.remove('d-none');
+    btn.disabled = false;
+    btn.innerHTML = '<i class="bi bi-box-arrow-in-right me-1"></i>Anmelden';
+  }
+}
+
+async function doLogout() {
+  try {
+    await fetch(API + '/logout', { method: 'POST' });
+  } catch { /* ignore */ }
+  state.auth = { username: null, is_ipmi_user: false };
+  _updateAuthUI();
+  showToast('Abgemeldet', 'secondary');
+}
+
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
-document.addEventListener('DOMContentLoaded', loadGroups);
+document.addEventListener('DOMContentLoaded', async () => {
+  await loadAuth();
+  await loadGroups();
+});

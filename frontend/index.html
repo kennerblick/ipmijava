@@ -15,16 +15,18 @@
     <span class="navbar-brand mb-0 fw-bold">
       <i class="bi bi-cpu-fill text-primary me-2"></i>IPMI Manager
     </span>
-    <div class="d-flex gap-2 ms-auto">
+    <div class="d-flex gap-2 ms-auto align-items-center">
       <button class="btn btn-sm btn-outline-secondary" onclick="refreshAll()" title="Alle Status aktualisieren">
         <i class="bi bi-arrow-clockwise"></i> Refresh
       </button>
-      <button class="btn btn-sm btn-outline-warning" onclick="showScanModal()">
+      <button id="nav-scan-btn" class="btn btn-sm btn-outline-warning d-none" onclick="showScanModal()">
         <i class="bi bi-radar"></i> Scan
       </button>
-      <button class="btn btn-sm btn-primary" onclick="showAddGroupModal()">
+      <button id="nav-gruppe-btn" class="btn btn-sm btn-primary d-none" onclick="showAddGroupModal()">
         <i class="bi bi-plus-lg"></i> Gruppe
       </button>
+      <!-- Auth -->
+      <div id="auth-nav" class="d-flex gap-2 align-items-center ms-1"></div>
     </div>
   </nav>
 
@@ -217,6 +219,48 @@
           <iframe id="kvm-frame"
                   style="width:100%;height:100%;border:none;position:absolute;top:0;left:0;">
           </iframe>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Login Modal ────────────────────────────────────────── -->
+  <div class="modal fade" id="loginModal" tabindex="-1" data-bs-backdrop="static">
+    <div class="modal-dialog modal-sm">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title"><i class="bi bi-shield-lock me-2 text-primary"></i>Anmelden</h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted small mb-3">
+            Active Directory — <code>av-test.int</code><br>
+            Aktionen erfordern die Gruppe <strong>IPMIUser</strong>.
+          </p>
+          <div class="mb-3">
+            <label class="form-label">Benutzername</label>
+            <input type="text" class="form-control" id="login-user-input"
+                   placeholder="vorname.nachname"
+                   onkeypress="if(event.key==='Enter') document.getElementById('login-pass-input').focus()">
+          </div>
+          <div class="mb-3">
+            <label class="form-label">Passwort</label>
+            <div class="input-group">
+              <input type="password" class="form-control" id="login-pass-input"
+                     onkeypress="if(event.key==='Enter') doLogin()">
+              <button class="btn btn-outline-secondary" type="button"
+                      onclick="togglePassword('login-pass-input', this)">
+                <i class="bi bi-eye"></i>
+              </button>
+            </div>
+          </div>
+          <div id="login-error" class="alert alert-danger d-none py-2 small"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Abbrechen</button>
+          <button type="button" class="btn btn-primary" id="login-btn" onclick="doLogin()">
+            <i class="bi bi-box-arrow-in-right me-1"></i>Anmelden
+          </button>
         </div>
       </div>
     </div>

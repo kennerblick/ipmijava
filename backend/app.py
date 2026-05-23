@@ -2,6 +2,7 @@ import asyncio as _asyncio
 import json
 import os
 import re
+import secrets as _secrets
 import socket
 import subprocess
 import sys
@@ -10,16 +11,111 @@ import time
 import uuid
 import ipaddress
 import concurrent.futures
+from functools import wraps
 
 import requests as req_lib
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-from flask import Flask, jsonify, redirect, request, send_from_directory, Response
+from flask import Flask, jsonify, redirect, request, send_from_directory, Response, session
 
 app = Flask(__name__)
-CONFIG_PATH = os.environ.get('CONFIG_PATH', '/config/servers.json')
+app.secret_key = os.environ.get('SECRET_KEY') or _secrets.token_hex(32)
+
+CONFIG_PATH  = os.environ.get('CONFIG_PATH', '/config/servers.json')
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'frontend')
+
+# ── AD / LDAP Auth ───────────────────────────────────────────────────────────────
+
+LDAP_SERVER   = os.environ.get('LDAP_SERVER',   '192.168.2.34')
+LDAP_DOMAIN   = os.environ.get('LDAP_DOMAIN',   'domain.av-test.int')
+LDAP_BASE_DN  = os.environ.get('LDAP_BASE_DN',  'DC=domain,DC=av-test,DC=int')
+IPMI_GROUP_DN = os.environ.get('IPMI_GROUP_DN',
+                                'CN=IPMIUser,OU=Benutzer,DC=domain,DC=av-test,DC=int')
+
+
+def _ldap_authenticate(username: str, password: str) -> tuple[bool, bool]:
+    """Bind to AD with username@LDAP_DOMAIN, check IPMIUser group.
+    Returns (authenticated, is_ipmi_user).
+    Fails closed if ldap3 is unavailable or the server is unreachable.
+    """
+    try:
+        from ldap3 import Server as _LServer, Connection as _LConn, ALL, SUBTREE
+    except ImportError:
+        return False, False
+
+    try:
+        srv  = _LServer(LDAP_SERVER, connect_timeout=5, get_info=ALL)
+        upn  = f"{username}@{LDAP_DOMAIN}"
+        conn = _LConn(srv, user=upn, password=password)
+        if not conn.bind():
+            return False, False
+    except Exception:
+        return False, False
+
+    is_ipmi_user = False
+    try:
+        conn.search(LDAP_BASE_DN,
+                    f'(sAMAccountName={username})',
+                    attributes=['memberOf'])
+        if conn.entries:
+            member_of = list(conn.entries[0].memberOf)
+            is_ipmi_user = any(
+                str(dn).lower() == IPMI_GROUP_DN.lower()
+                for dn in member_of
+            )
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.unbind()
+        except Exception:
+            pass
+
+    return True, is_ipmi_user
+
+
+def _is_ipmi_user() -> bool:
+    return bool(session.get('is_ipmi_user'))
+
+
+def require_ipmi_user(f):
+    """Decorator: return 403 unless the session belongs to an IPMIUser group member."""
+    @wraps(f)
+    def _deco(*args, **kwargs):
+        if not _is_ipmi_user():
+            return jsonify({'error': 'Nicht autorisiert — IPMIUser-Gruppe erforderlich'}), 403
+        return f(*args, **kwargs)
+    return _deco
+
+
+@app.route('/api/me', methods=['GET'])
+def api_me():
+    return jsonify({
+        'username':     session.get('username'),
+        'is_ipmi_user': session.get('is_ipmi_user', False),
+    })
+
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    d        = request.json or {}
+    username = d.get('username', '').strip()
+    password = d.get('password', '')
+    if not username or not password:
+        return jsonify({'error': 'Benutzername und Passwort erforderlich'}), 400
+    ok, is_ipmi = _ldap_authenticate(username, password)
+    if not ok:
+        return jsonify({'error': 'Ungültige Zugangsdaten'}), 401
+    session['username']     = username
+    session['is_ipmi_user'] = is_ipmi
+    return jsonify({'username': username, 'is_ipmi_user': is_ipmi})
+
+
+@app.route('/api/logout', methods=['POST'])
+def api_logout():
+    session.clear()
+    return jsonify({'ok': True})
 
 # kvm.py sits next to app.py — add its directory to sys.path for direct import
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -124,6 +220,7 @@ def api_get_groups():
 
 
 @app.route('/api/groups', methods=['POST'])
+@require_ipmi_user
 def api_create_group():
     name = (request.json or {}).get('name', '').strip()
     if not name:
@@ -136,6 +233,7 @@ def api_create_group():
 
 
 @app.route('/api/groups/<group_id>', methods=['PUT'])
+@require_ipmi_user
 def api_update_group(group_id):
     config = load_config()
     for g in config['groups']:
@@ -147,6 +245,7 @@ def api_update_group(group_id):
 
 
 @app.route('/api/groups/<group_id>', methods=['DELETE'])
+@require_ipmi_user
 def api_delete_group(group_id):
     config = load_config()
     config['groups'] = [g for g in config['groups'] if g['id'] != group_id]
@@ -157,6 +256,7 @@ def api_delete_group(group_id):
 # ── Servers ───────────────────────────────────────────────────────────────────────
 
 @app.route('/api/groups/<group_id>/servers', methods=['POST'])
+@require_ipmi_user
 def api_create_server(group_id):
     config = load_config()
     for g in config['groups']:
@@ -179,6 +279,7 @@ def api_create_server(group_id):
 
 
 @app.route('/api/servers/<server_id>', methods=['PUT'])
+@require_ipmi_user
 def api_update_server(server_id):
     config = load_config()
     server, group = find_server(config, server_id)
@@ -199,6 +300,7 @@ def api_update_server(server_id):
 
 
 @app.route('/api/servers/<server_id>', methods=['DELETE'])
+@require_ipmi_user
 def api_delete_server(server_id):
     config = load_config()
     for g in config['groups']:
@@ -208,6 +310,7 @@ def api_delete_server(server_id):
 
 
 @app.route('/api/scan/import', methods=['POST'])
+@require_ipmi_user
 def api_scan_import():
     config = load_config()
     ips = (request.json or {}).get('ips', [])
@@ -344,6 +447,7 @@ def _probe_server_caps(server: dict) -> dict:
 
 
 @app.route('/api/servers/<server_id>/probe', methods=['POST'])
+@require_ipmi_user
 def api_probe_server(server_id):
     config = load_config()
     server, _ = find_server(config, server_id)
@@ -414,6 +518,7 @@ POWER_ACTIONS = {
 
 
 @app.route('/api/servers/<server_id>/power', methods=['POST'])
+@require_ipmi_user
 def api_power_action(server_id):
     config = load_config()
     server, _ = find_server(config, server_id)
@@ -445,6 +550,7 @@ _JAVA_FIX_TMPL = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'java-
 
 
 @app.route('/api/servers/<server_id>/java-fix.ps1', methods=['GET'])
+@require_ipmi_user
 def api_java_fix(server_id):
     config = load_config()
     server, _ = find_server(config, server_id)
@@ -896,6 +1002,7 @@ def _rewrite_jnlp(jnlp_bytes: bytes, bmc_ip: str, server_id: str,
 # ── Console endpoints ─────────────────────────────────────────────────────────
 
 @app.route('/api/servers/<server_id>/jnlp', methods=['GET'])
+@require_ipmi_user
 def api_console_jnlp(server_id):
     """Login to BMC server-side, rewrite JNLP to proxy through Docker host, return as download.
 
@@ -980,6 +1087,7 @@ def api_jnlp_resource(server_id, res_path):
 
 
 @app.route('/api/servers/<server_id>/html5-kvm', methods=['GET'])
+@require_ipmi_user
 def api_html5_kvm(server_id):
     """Relay page: logs the browser into the BMC via a popup, then navigates to
     the BMC's built-in HTML5 KVM viewer (man_ikvm_html5). No Java required.
@@ -1828,6 +1936,7 @@ def kvm_proxy_asset(session_id, asset_path):
 # ── KVM Browser Sessions ─────────────────────────────────────────────────────────
 
 @app.route('/api/servers/<server_id>/kvm-session', methods=['POST'])
+@require_ipmi_user
 def api_kvm_start(server_id):
     if not _KVM_AVAILABLE:
         return jsonify({'error': 'KVM nicht verfügbar (Xvfb/x11vnc nicht installiert)'}), 503
@@ -1900,6 +2009,7 @@ def api_kvm_stop(server_id):
 # ── Network Scan ──────────────────────────────────────────────────────────────────
 
 @app.route('/api/scan', methods=['POST'])
+@require_ipmi_user
 def api_scan():
     network = (request.json or {}).get('network', '').strip()
     if not network:
