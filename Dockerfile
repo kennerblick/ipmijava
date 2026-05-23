@@ -8,7 +8,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         openjdk-17-jre \
         python3-websockify \
         procps \
+        stunnel4 psmisc xdotool \
+    && ln -sf /usr/bin/stunnel4 /usr/bin/stunnel \
     && rm -rf /var/lib/apt/lists/*
+
+# OpenJDK 8 JRE (Temurin/Adoptium) — the only tool that can unpack ATEN's
+# non-standard Pack200 JARs (version bytes 1,160 vs standard 7,150).
+# Also used to run KVMMain directly, bypassing IcedTea-Web/javaws entirely.
+RUN curl -fsSL \
+    "https://api.adoptium.net/v3/binary/latest/8/ga/linux/x64/jre/hotspot/normal/eclipse" \
+    -o /tmp/jre8.tar.gz \
+    && mkdir -p /opt/jre8 \
+    && tar xzf /tmp/jre8.tar.gz -C /opt/jre8 --strip-components=1 \
+    && rm /tmp/jre8.tar.gz
 
 # Patch java.security in-container: remove SHA1 from disabled algorithm lists
 # so ATEN iKVM JARs (signed with SHA1withRSA) can run.
@@ -72,6 +84,8 @@ EXPOSE 9193
 EXPOSE 6080-6089
 # TCP proxy ports — one per concurrent Java iKVM session
 EXPOSE 6090-6099
+# websockify ports — one per in-container Java KVM session (noVNC stream)
+EXPOSE 6100-6109
 
 # Single worker + threads so kvm.py session dict is shared across requests.
 # 8 threads: bulk-status holds one thread while its ThreadPoolExecutor runs;

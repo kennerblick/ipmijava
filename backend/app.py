@@ -3,12 +3,15 @@ import json
 import os
 import re
 import secrets as _secrets
+import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
+import zipfile as _zipfile
 import ipaddress
 import concurrent.futures
 from functools import wraps
@@ -997,6 +1000,298 @@ def _rewrite_jnlp(jnlp_bytes: bytes, bmc_ip: str, server_id: str,
     )
 
     return text.encode('utf-8')
+
+
+# ── Java KVM in-container sessions ───────────────────────────────────────────
+# Runs JViewer.jar inside Xtigervnc + websockify inside Docker.
+# The browser uses noVNC to view the session — no Java on the client needed.
+
+_JKVM_VNC_PORTS = range(5950, 5960)   # virtual displays :50–:59 (internal)
+_JKVM_WSP_PORTS = range(6100, 6110)   # websockify WS ports (exposed to browser)
+
+_jkvm_sessions:  dict[str, dict] = {}   # session_id → session dict
+_jkvm_by_server: dict[str, str]  = {}   # server_id  → session_id
+_jkvm_lock = threading.Lock()
+
+
+def _jkvm_alloc_ports() -> tuple[int | None, int | None]:
+    used_vnc = {s['port_vnc'] for s in _jkvm_sessions.values()}
+    used_wsp = {s['port_wsp'] for s in _jkvm_sessions.values()}
+    vnc = next((p for p in _JKVM_VNC_PORTS if p not in used_vnc), None)
+    wsp = next((p for p in _JKVM_WSP_PORTS if p not in used_wsp), None)
+    return vnc, wsp
+
+
+def _jkvm_cleanup(sess: dict) -> None:
+    for p in sess.get('procs', []):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    tmpdir = sess.get('tmpdir')
+    if tmpdir and os.path.isdir(tmpdir):
+        shutil.rmtree(tmpdir, ignore_errors=True)
+    sess['status'] = 'stopped'
+
+
+def _jkvm_start(server: dict) -> dict:
+    with _jkvm_lock:
+        # Stop any existing session for this server
+        old_sid = _jkvm_by_server.get(server['id'])
+        if old_sid and old_sid in _jkvm_sessions:
+            old = _jkvm_sessions.pop(old_sid)
+            _jkvm_cleanup(old)
+        vnc, wsp = _jkvm_alloc_ports()
+        if vnc is None or wsp is None:
+            raise RuntimeError('Alle Java-KVM-Ports belegt (max 10 parallele Sitzungen)')
+        sid  = str(uuid.uuid4())
+        sess = {
+            'id':        sid,
+            'server_id': server['id'],
+            'status':    'starting',
+            'message':   'Initialisiere…',
+            'error':     None,
+            'port_vnc':  vnc,
+            'port_wsp':  wsp,
+            'display':   f':{vnc - 5900}',
+            'procs':     [],
+            'tmpdir':    None,
+        }
+        _jkvm_sessions[sid]           = sess
+        _jkvm_by_server[server['id']] = sid
+
+    threading.Thread(target=_jkvm_worker, args=(sess, server), daemon=True).start()
+    return sess
+
+
+def _jkvm_worker(sess: dict, server: dict) -> None:
+    try:
+        _jkvm_run(sess, server)
+    except Exception as exc:
+        sess['status']  = 'error'
+        sess['error']   = str(exc)
+        sess['message'] = 'Fehler'
+        _jkvm_cleanup(sess)
+
+
+_JRE8_JAVA = '/opt/jre8/bin/java'
+_UNPACK200  = '/opt/jre8/bin/unpack200'
+
+
+def _jkvm_run(sess: dict, server: dict) -> None:
+    bmc_ip = server['ip']
+    base   = f"https://{bmc_ip}"
+    tmpdir = tempfile.mkdtemp(prefix='jkvm_')
+    sess['tmpdir'] = tmpdir
+    procs = sess['procs']
+
+    # 1. Login to BMC
+    sess['message'] = 'Anmeldung am BMC…'
+    bmc_sess, sid = _bmc_login(base, server['username'], server['password'])
+    if not sid:
+        raise RuntimeError('BMC-Anmeldung fehlgeschlagen')
+
+    # 2. Fetch JNLP with valid session tokens
+    sess['message'] = 'Lade JNLP…'
+    jnlp_r = _fetch_jnlp(bmc_sess, base, sid)
+    if not jnlp_r or b'<jnlp' not in jnlp_r.content.lower():
+        raise RuntimeError('JNLP nicht gefunden')
+    jnlp_text = jnlp_r.content.decode('utf-8', errors='replace')
+
+    # 3. Parse JNLP: codebase, main JAR, native lib, main class, arguments
+    cb_m     = re.search(r'codebase=["\']([^"\']+)["\']', jnlp_text, re.I)
+    codebase = cb_m.group(1).rstrip('/') if cb_m else base
+
+    jar_m = (re.search(r'<jar\s[^>]*href=["\']([^"\']+)["\'][^>]*main=["\']true["\']', jnlp_text, re.I | re.S)
+             or re.search(r'<jar\s[^>]*main=["\']true["\'][^>]*href=["\']([^"\']+)["\']', jnlp_text, re.I | re.S)
+             or re.search(r'<jar\s[^>]*href=["\']([^"\']+)["\']', jnlp_text, re.I))
+    if not jar_m:
+        raise RuntimeError('Kein JAR in JNLP gefunden')
+    main_jar_href = jar_m.group(1)
+
+    native_m    = re.search(r'<nativelib\s[^>]*href=["\']([^"\']+)["\']', jnlp_text, re.I)
+    native_href = native_m.group(1) if native_m else None
+    mc_m        = re.search(r'main-class=["\']([^"\']+)["\']', jnlp_text, re.I)
+    main_class  = mc_m.group(1) if mc_m else 'tw.com.aten.ikvm.KVMMain'
+    kvm_args    = re.findall(r'<argument>([^<]*)</argument>', jnlp_text)
+
+    # 4. Download and unpack JARs.
+    #    ATEN BMC serves JARs as Pack200 (.jar.pack.gz) with a non-standard version
+    #    byte (1,160) that only JRE 8's unpack200 can handle — all newer tools reject it.
+    sess['message'] = 'Lade Java-Komponenten…'
+    jars_dir   = os.path.join(tmpdir, 'jars')
+    native_dir = os.path.join(tmpdir, 'native')
+    os.makedirs(jars_dir,   exist_ok=True)
+    os.makedirs(native_dir, exist_ok=True)
+
+    def _download_unpack(href: str) -> str:
+        dest = os.path.join(jars_dir, os.path.basename(href))
+        for url in (f"{codebase}/{href}.pack.gz", f"{codebase}/{href}"):
+            try:
+                r = bmc_sess.get(url, timeout=60, verify=False)
+                if r.status_code == 200 and len(r.content) > 200:
+                    if url.endswith('.pack.gz'):
+                        packed = dest + '.pack.gz'
+                        with open(packed, 'wb') as fh:
+                            fh.write(r.content)
+                        res = subprocess.run(
+                            [_UNPACK200, packed, dest],
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        os.unlink(packed)
+                        if res.returncode != 0 or not os.path.exists(dest):
+                            raise RuntimeError(f'unpack200 fehlgeschlagen: {res.stderr.strip()}')
+                    else:
+                        with open(dest, 'wb') as fh:
+                            fh.write(r.content)
+                    return dest
+            except RuntimeError:
+                raise
+            except Exception:
+                continue
+        raise RuntimeError(f'JAR nicht herunterladbar: {href}')
+
+    main_jar = _download_unpack(main_jar_href)
+
+    if native_href:
+        try:
+            native_jar = _download_unpack(native_href)
+            with _zipfile.ZipFile(native_jar) as zf:
+                for name in zf.namelist():
+                    if name.endswith('.so'):
+                        data = zf.read(name)
+                        with open(os.path.join(native_dir, os.path.basename(name)), 'wb') as fh:
+                            fh.write(data)
+        except Exception:
+            pass
+
+    # 5. Start Xtigervnc (virtual display + VNC server)
+    sess['message'] = 'Starte virtuelles Display…'
+    vnc_proc = subprocess.Popen(
+        [
+            'Xtigervnc', sess['display'],
+            '-rfbport', str(sess['port_vnc']),
+            '-SecurityTypes', 'None',
+            '-geometry', '1280x1024',
+            '-depth', '24',
+            '-localhost', 'no',
+        ],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    procs.append(vnc_proc)
+    time.sleep(1.5)
+    if vnc_proc.poll() is not None:
+        raise RuntimeError('Xtigervnc konnte nicht gestartet werden')
+
+    # 6. Start websockify
+    sess['message'] = 'Starte WebSocket-Bridge…'
+    wsp_proc = subprocess.Popen(
+        ['websockify', str(sess['port_wsp']), f'0.0.0.0:{sess["port_vnc"]}'],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    procs.append(wsp_proc)
+    time.sleep(0.5)
+
+    # 7. Run KVMMain directly with JRE 8 — no IcedTea-Web/javaws needed.
+    #    ATEN KVM extracts its own stunnel binary from the JAR at runtime and uses
+    #    killall (psmisc) for clean stunnel teardown.
+    sess['message'] = 'Starte Java-KVM-Viewer…'
+    log_path = os.path.join(tmpdir, 'java_kvm.log')
+    env = os.environ.copy()
+    env['DISPLAY']           = sess['display']
+    env['HOME']              = tmpdir
+    env['LD_LIBRARY_PATH']   = native_dir + (':' + env['LD_LIBRARY_PATH'] if 'LD_LIBRARY_PATH' in env else '')
+    env['JAVA_TOOL_OPTIONS'] = (
+        '-Dawt.useSystemAAFontSettings=off'
+        ' -Dswing.defaultlaf=javax.swing.plaf.metal.MetalLookAndFeel'
+    )
+    with open(log_path, 'wb') as log_fh:
+        java_proc = subprocess.Popen(
+            [_JRE8_JAVA, '-cp', main_jar, main_class] + kvm_args,
+            env=env, stdout=log_fh, stderr=log_fh, cwd=tmpdir,
+        )
+    procs.append(java_proc)
+    time.sleep(3.0)
+    if java_proc.poll() is not None:
+        raise RuntimeError('Java KVM konnte nicht gestartet werden (Prozess sofort beendet)')
+
+    sess['status']  = 'running'
+    sess['message'] = 'Verbunden'
+
+
+def _jkvm_info(sess: dict) -> dict:
+    return {
+        'session_id': sess['id'],
+        'port_wsp':   sess['port_wsp'],
+        'status':     sess['status'],
+        'message':    sess['message'],
+        'error':      sess['error'],
+    }
+
+
+@app.route('/java-kvm/<session_id>/view')
+def java_kvm_view(session_id):
+    """Redirect to noVNC viewer for this Java KVM session."""
+    with _jkvm_lock:
+        sess = _jkvm_sessions.get(session_id)
+    if not sess or sess['status'] == 'stopped':
+        return Response(
+            '<html><body style="background:#0d1117;color:#e6edf3;font-family:sans-serif;'
+            'display:flex;align-items:center;justify-content:center;height:100vh;margin:0">'
+            '<p>Java-KVM-Session nicht gefunden oder beendet</p></body></html>',
+            content_type='text/html',
+        )
+    ws_port = sess['port_wsp']
+    html = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Java KVM</title>'
+        '<style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden}</style>'
+        '</head><body>'
+        '<script>'
+        f'window.location.replace("/novnc/vnc.html?host="+encodeURIComponent(window.location.hostname)'
+        f'+"&port={ws_port}&autoconnect=true&resize=scale");'
+        '</script></body></html>'
+    )
+    return Response(html, content_type='text/html')
+
+
+@app.route('/api/servers/<server_id>/java-kvm-session', methods=['POST'])
+@require_ipmi_user
+def api_java_kvm_start(server_id):
+    config = load_config()
+    server, _ = find_server(config, server_id)
+    if not server:
+        return jsonify({'error': 'Nicht gefunden'}), 404
+    with _jkvm_lock:
+        sid = _jkvm_by_server.get(server_id)
+        if sid and sid in _jkvm_sessions:
+            s = _jkvm_sessions[sid]
+            if s['status'] not in ('stopped', 'error'):
+                return jsonify(_jkvm_info(s))
+    try:
+        sess = _jkvm_start(server)
+        return jsonify(_jkvm_info(sess)), 201
+    except RuntimeError as e:
+        return jsonify({'error': str(e)}), 503
+
+
+@app.route('/api/servers/<server_id>/java-kvm-session', methods=['GET'])
+def api_java_kvm_status(server_id):
+    with _jkvm_lock:
+        sid = _jkvm_by_server.get(server_id)
+        if not sid or sid not in _jkvm_sessions:
+            return jsonify({'status': 'none'}), 404
+        return jsonify(_jkvm_info(_jkvm_sessions[sid]))
+
+
+@app.route('/api/servers/<server_id>/java-kvm-session', methods=['DELETE'])
+@require_ipmi_user
+def api_java_kvm_stop(server_id):
+    with _jkvm_lock:
+        sid = _jkvm_by_server.pop(server_id, None)
+        sess = _jkvm_sessions.pop(sid, None) if sid else None
+    if sess:
+        threading.Thread(target=_jkvm_cleanup, args=(sess,), daemon=True).start()
+    return '', 204
 
 
 # ── Console endpoints ─────────────────────────────────────────────────────────
