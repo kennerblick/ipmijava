@@ -1,9 +1,12 @@
+import asyncio as _asyncio
 import json
 import os
 import re
 import socket
 import subprocess
 import sys
+import threading
+import time
 import uuid
 import ipaddress
 import concurrent.futures
@@ -777,202 +780,203 @@ def _fetch_jnlp_from_mainmenu(sess: req_lib.Session, base: str, sid: str | None)
     return None
 
 
+# ── Java KVM TCP proxy ────────────────────────────────────────────────────────
+# Each Java iKVM session gets a dedicated TCP proxy port (6090-6099).
+# The JNLP codebase and connection args are rewritten to point to the Docker
+# host, so the client never needs direct network access to the BMC.
+
+_JAVA_KVM_PORTS = range(6090, 6100)
+_java_kvm_sessions: dict[int, dict] = {}   # local_port → session info
+_java_kvm_lock = threading.Lock()
+_jnlp_codebase_cache: dict[str, str] = {}  # server_id → original codebase URL
+
+
+def _start_java_tcp_proxy(local_port: int, remote_ip: str, remote_port: int) -> threading.Event:
+    """Start a raw TCP proxy in a daemon thread. Returns stop_event."""
+    stop_ev = threading.Event()
+
+    def _run():
+        async def _handle(reader, writer):
+            try:
+                rr, rw = await _asyncio.wait_for(
+                    _asyncio.open_connection(remote_ip, remote_port), timeout=10
+                )
+            except Exception:
+                try: writer.close()
+                except Exception: pass
+                return
+
+            async def _fwd(src, dst):
+                try:
+                    while not stop_ev.is_set():
+                        try:
+                            data = await _asyncio.wait_for(src.read(65536), timeout=2.0)
+                        except _asyncio.TimeoutError:
+                            continue
+                        if not data:
+                            break
+                        dst.write(data)
+                        await dst.drain()
+                except Exception:
+                    pass
+                finally:
+                    try: dst.close()
+                    except Exception: pass
+
+            await _asyncio.gather(_fwd(reader, rw), _fwd(rr, writer), return_exceptions=True)
+
+        async def _serve():
+            srv = await _asyncio.start_server(_handle, '0.0.0.0', local_port)
+            async with srv:
+                while not stop_ev.is_set():
+                    await _asyncio.sleep(0.3)
+
+        _asyncio.run(_serve())
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    time.sleep(0.3)  # let the asyncio server bind before we return
+    return stop_ev
+
+
+def _java_kvm_alloc(bmc_ip: str, bmc_port: int, server_id: str) -> int | None:
+    """Allocate a proxy port, start TCP proxy, return local port (or None if full)."""
+    with _java_kvm_lock:
+        now = time.time()
+        for p in list(_java_kvm_sessions):
+            if _java_kvm_sessions[p]['expires'] < now:
+                _java_kvm_sessions[p]['stop_ev'].set()
+                del _java_kvm_sessions[p]
+        port = next((p for p in _JAVA_KVM_PORTS if p not in _java_kvm_sessions), None)
+        if port is None:
+            return None
+        stop_ev = _start_java_tcp_proxy(port, bmc_ip, bmc_port)
+        _java_kvm_sessions[port] = {
+            'stop_ev':   stop_ev,
+            'bmc_ip':    bmc_ip,
+            'bmc_port':  bmc_port,
+            'server_id': server_id,
+            'expires':   now + 3600,
+        }
+        return port
+
+
+def _rewrite_jnlp(jnlp_bytes: bytes, bmc_ip: str, server_id: str,
+                   proxy_host: str, proxy_port: int, app_base: str) -> bytes:
+    """Rewrite JNLP so the client connects through the Docker host:
+    - codebase  → /api/servers/<id>/jnlp-res  (JAR proxy)
+    - first IP <argument>  → proxy_host
+    - port <argument> directly after IP  → proxy_port
+    """
+    text = jnlp_bytes.decode('utf-8', errors='replace')
+
+    # Cache and rewrite codebase attribute
+    m_cb = re.search(r'codebase=["\']([^"\']+)["\']', text, re.I)
+    if m_cb:
+        _jnlp_codebase_cache[server_id] = m_cb.group(1)
+        text = (text[:m_cb.start()] +
+                f'codebase="{app_base}/api/servers/{server_id}/jnlp-res"' +
+                text[m_cb.end():])
+
+    # Rewrite BMC IP argument → proxy_host
+    text = text.replace(f'<argument>{bmc_ip}</argument>',
+                        f'<argument>{proxy_host}</argument>', 1)
+
+    # Rewrite the port argument immediately following the (rewritten) IP
+    text = re.sub(
+        rf'(<argument>{re.escape(proxy_host)}</argument>\s*<argument>)(\d{{4,5}})(</argument>)',
+        lambda m: m.group(1) + str(proxy_port) + m.group(3),
+        text,
+        count=1,
+    )
+
+    return text.encode('utf-8')
+
+
 # ── Console endpoints ─────────────────────────────────────────────────────────
 
 @app.route('/api/servers/<server_id>/jnlp', methods=['GET'])
 def api_console_jnlp(server_id):
-    """Return an HTML relay page that logs the user's browser into the BMC
-    and opens the Console Redirection page (man_ikvm) in a new tab.
+    """Login to BMC server-side, rewrite JNLP to proxy through Docker host, return as download.
 
-    Background: url_redirect.cgi?url_name=ikvm validates the requesting client IP
-    against the session's registered IP. A backend proxy therefore always gets 404 —
-    the JNLP is only served to the browser that originally established the session.
-    Solution: log the browser in via a hidden iframe (sets SID cookie in the user's
-    browser for the BMC domain), then open man_ikvm in a new tab where the user
-    clicks "Launch iKVM" to download the JNLP directly.
+    The client never needs direct network access to the BMC:
+    - JAR/native-lib downloads are proxied via /api/servers/<id>/jnlp-res/<path>
+    - The KVM TCP connection is forwarded on a port from the range 6090–6099
+    Works for both ATEN (url_redirect.cgi) and AMI MegaRAC / GoAhead firmwares.
     """
     config = load_config()
     server, _ = find_server(config, server_id)
     if not server:
         return jsonify({'error': 'Server nicht gefunden'}), 404
 
-    base = f"https://{server['ip']}"
+    bmc_ip   = server['ip']
+    base     = f"https://{bmc_ip}"
+    ip_safe  = re.sub(r'[^a-zA-Z0-9]', '_', bmc_ip)
 
-    # GoAhead (AMI MegaRAC) detection: ATEN login returns 405 → use GoAhead path.
-    # GoAhead login yields SESSION_COOKIE in response body; JNLP must be fetched
-    # server-side because the browser cannot set cookies via response body.
+    # Docker host address the client uses to reach us
+    proxy_host = request.host.split(':')[0]
+    scheme     = 'https' if request.is_secure else 'http'
+    app_base   = f"{scheme}://{request.host}"
+
+    # Login (handles ATEN and GoAhead automatically)
+    sess, sid = _bmc_login(base, server['username'], server['password'])
+    if not sid:
+        return jsonify({'error': 'BMC-Anmeldung fehlgeschlagen'}), 503
+
+    # Fetch JNLP from BMC (server-side; same session IP → ATEN IP-check passes)
+    jnlp_r = _fetch_jnlp(sess, base, sid)
+    if not jnlp_r or not jnlp_r.content or b'<jnlp' not in jnlp_r.content.lower():
+        return jsonify({'error': 'JNLP nicht gefunden oder ungültig'}), 404
+
+    jnlp_text = jnlp_r.content.decode('utf-8', errors='replace')
+
+    # Find the KVM port: first numeric argument directly after the BMC IP argument
+    m_port = re.search(
+        rf'<argument>{re.escape(bmc_ip)}</argument>\s*<argument>(\d{{4,5}})</argument>',
+        jnlp_text,
+    )
+    kvm_port = int(m_port.group(1)) if m_port else 5901
+
+    # Allocate proxy port and start TCP forwarder
+    proxy_port = _java_kvm_alloc(bmc_ip, kvm_port, server_id)
+    if proxy_port is None:
+        return jsonify({'error': 'Alle Java-KVM-Ports belegt (max 10 parallele Sitzungen)'}), 503
+
+    # Rewrite JNLP (codebase + IP + KVM port)
+    jnlp_out = _rewrite_jnlp(jnlp_r.content, bmc_ip, server_id,
+                               proxy_host, proxy_port, app_base)
+
+    return Response(
+        jnlp_out,
+        content_type='application/x-java-jnlp-file',
+        headers={'Content-Disposition': f'attachment; filename="jviewer-{ip_safe}.jnlp"'},
+    )
+
+
+@app.route('/api/servers/<server_id>/jnlp-res', defaults={'res_path': ''}, methods=['GET'])
+@app.route('/api/servers/<server_id>/jnlp-res/<path:res_path>', methods=['GET'])
+def api_jnlp_resource(server_id, res_path):
+    """Proxy JNLP resources (JARs, native libs) from BMC to browser.
+
+    Java Web Start downloads resources relative to the rewritten codebase URL.
+    We forward them from the original BMC codebase so the client never needs
+    direct network access to the BMC.
+    """
+    codebase = _jnlp_codebase_cache.get(server_id)
+    if not codebase:
+        config = load_config()
+        srv, _ = find_server(config, server_id)
+        if not srv:
+            return jsonify({'error': 'Nicht gefunden'}), 404
+        codebase = f"https://{srv['ip']}/Java"  # AMI MegaRAC default
+
+    url = codebase.rstrip('/') + ('/' + res_path.lstrip('/') if res_path else '')
     try:
-        _test_r = req_lib.Session()
-        _test_r.verify = False
-        _aten_chk = _test_r.post(f"{base}/cgi/login.cgi",
-            data={'name': server['username'], 'pwd': server['password']},
-            timeout=6, allow_redirects=False)
-        _is_goahead = (_aten_chk.status_code == 405)
-    except Exception:
-        _is_goahead = False
-
-    if _is_goahead:
-        go_sid = _bmc_login_goahead(_test_r, base, server['username'], server['password'])
-        if go_sid:
-            _test_r.cookies.set('SessionCookie', go_sid)
-            # Try GoAhead-specific JNLP paths directly (skip slow ATEN path scan)
-            for _gpath in ('/Java/jviewer.jnlp', '/Java/JViewer.jnlp'):
-                try:
-                    _gr = _test_r.get(f"{base}{_gpath}", timeout=10, stream=True)
-                    _gbody = _read_response_body(_gr)
-                    if b'<jnlp' in _gbody.lower():
-                        ip_safe = re.sub(r'[^a-zA-Z0-9]', '_', server['ip'])
-                        return Response(
-                            _gbody,
-                            content_type='application/x-java-jnlp-file',
-                            headers={'Content-Disposition': f'attachment; filename="jviewer-{ip_safe}.jnlp"'},
-                        )
-                except Exception:
-                    continue
-        return jsonify({'error': 'GoAhead JNLP-Abruf fehlgeschlagen'}), 503
-
-    import html as html_mod
-    ip          = html_mod.escape(server['ip'])
-    username    = html_mod.escape(server['username'])
-    password    = html_mod.escape(server['password'])
-    bmc_base    = base
-    login_url   = f"{bmc_base}/cgi/login.cgi"
-    console_url = f"{bmc_base}/cgi/url_redirect.cgi?url_name=man_ikvm"
-
-    page = f"""<!DOCTYPE html>
-<html lang="de">
-<head>
-  <meta charset="UTF-8">
-  <title>iKVM – {ip}</title>
-  <style>
-    body {{ font-family:sans-serif; background:#0d1117; color:#e6edf3;
-            display:flex; flex-direction:column; align-items:center;
-            justify-content:center; min-height:100vh; margin:0; padding:1rem;
-            text-align:center; }}
-    h2 {{ margin-bottom:.5rem; }}
-    p  {{ color:#8b949e; margin:.4rem 0; font-size:.95rem; }}
-    .btn {{ display:inline-block; padding:.55rem 1.4rem; background:#1f6feb;
-             color:#fff; border:none; border-radius:6px; cursor:pointer;
-             font-size:1rem; text-decoration:none; margin:.4rem .2rem; }}
-    .btn:hover {{ background:#388bfd; }}
-    .btn-sec {{ background:#30363d; color:#e6edf3; }}
-    .btn-sec:hover {{ background:#484f58; }}
-    .spinner {{ display:inline-block; width:1rem; height:1rem;
-                border:3px solid #30363d; border-top-color:#58a6ff;
-                border-radius:50%; animation:spin .8s linear infinite;
-                vertical-align:middle; margin-right:.4rem; }}
-    @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
-    #step-error {{ display:none; color:#f85149; }}
-    #step-retry {{ display:none; }}
-  </style>
-</head>
-<body>
-  <!--
-    Login form — submitted into a tiny popup window.
-    A popup (not an iframe) establishes its own first-party browsing context
-    for the BMC domain, so the SID cookie goes into the unpartitioned global
-    store.  When this relay tab then navigates to man_ikvm the cookie is
-    present and the "session timed out" error does not occur.
-  -->
-  <form id="lf" action="{login_url}" method="post">
-    <input type="hidden" name="name" value="{username}">
-    <input type="hidden" name="pwd"  value="{password}">
-  </form>
-
-  <div id="step-working">
-    <h2>iKVM — {ip}</h2>
-    <p><span class="spinner"></span><span id="status-msg">Anmeldung am BMC…</span></p>
-  </div>
-
-  <div id="step-retry">
-    <h2>iKVM — {ip}</h2>
-    <p>Popup-Fenster wurde vom Browser blockiert.</p>
-    <button class="btn" onclick="startLogin()">🔑 Anmelden &amp; Konsole öffnen</button>
-    <br>
-    <a href="{bmc_base}" target="_blank" class="btn btn-sec" style="margin-top:.6rem">BMC direkt öffnen</a>
-  </div>
-
-  <div id="step-error">
-    <h2>Fehler</h2>
-    <p id="error-msg">Anmeldung fehlgeschlagen oder Timeout.</p>
-    <button class="btn" onclick="startLogin()">Erneut versuchen</button>
-    <a href="{bmc_base}" target="_blank" class="btn btn-sec">BMC direkt öffnen</a>
-  </div>
-
-  <script>
-  var CONSOLE_URL = '{console_url}';
-  var pollTimer   = null;
-  var timeoutId   = null;
-  var loginPopup  = null;
-
-  function startLogin() {{
-    document.getElementById('step-retry').style.display  = 'none';
-    document.getElementById('step-error').style.display  = 'none';
-    document.getElementById('step-working').style.display = 'block';
-    document.getElementById('status-msg').textContent = 'Anmeldung am BMC…';
-
-    // Open a tiny off-screen popup — it is its own top-level browsing context,
-    // so cookies the BMC sets inside it land in the global (unpartitioned)
-    // first-party store for the BMC domain.
-    loginPopup = window.open(
-      'about:blank', 'bmc_login_popup',
-      'width=1,height=1,left=-200,top=-200,menubar=no,toolbar=no,status=no,scrollbars=no'
-    );
-
-    if (!loginPopup) {{
-      // Popup blocker active — show manual button
-      document.getElementById('step-working').style.display = 'none';
-      document.getElementById('step-retry').style.display   = 'block';
-      return;
-    }}
-
-    // Route form submission into the popup
-    var form = document.getElementById('lf');
-    form.setAttribute('target', 'bmc_login_popup');
-    form.submit();
-
-    // Poll until the popup crosses into BMC domain (becomes cross-origin)
-    pollTimer = setInterval(checkPopup, 150);
-    timeoutId = setTimeout(onTimeout, 15000);
-  }}
-
-  function checkPopup() {{
-    if (!loginPopup || loginPopup.closed) {{
-      clearInterval(pollTimer); pollTimer = null;
-      return;
-    }}
-    try {{
-      // As long as the popup is on about:blank or our own origin this succeeds
-      var _unused = loginPopup.location.href;
-    }} catch (e) {{
-      // SecurityError: popup navigated to the BMC domain —
-      // login response has been received, SID cookie is now set (first-party).
-      clearInterval(pollTimer); pollTimer = null;
-      clearTimeout(timeoutId);
-      // Brief pause so the browser fully commits the cookie, then navigate
-      setTimeout(function() {{
-        try {{ loginPopup.close(); }} catch (_) {{}}
-        window.location.href = CONSOLE_URL;
-      }}, 250);
-    }}
-  }}
-
-  function onTimeout() {{
-    clearInterval(pollTimer); pollTimer = null;
-    if (loginPopup && !loginPopup.closed) {{ try {{ loginPopup.close(); }} catch(_) {{}} }}
-    document.getElementById('step-working').style.display = 'none';
-    document.getElementById('step-error').style.display   = 'block';
-    document.getElementById('error-msg').textContent =
-      'Timeout — BMC nicht erreichbar oder falsche Zugangsdaten.';
-  }}
-
-  // Auto-start: this page was opened by a user click so window.open is
-  // typically allowed; if not the retry button is shown.
-  startLogin();
-  </script>
-</body>
-</html>"""
-    return Response(page, content_type='text/html')
+        r = req_lib.get(url, verify=False, stream=True, timeout=60)
+        ct = r.headers.get('Content-Type', 'application/octet-stream')
+        return Response(r.iter_content(65536), status=r.status_code, content_type=ct)
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 502
 
 
 @app.route('/api/servers/<server_id>/html5-kvm', methods=['GET'])

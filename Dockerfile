@@ -68,8 +68,10 @@ COPY frontend/ ./frontend/
 ENV CONFIG_PATH=/config/servers.json
 
 EXPOSE 9193
-# websockify WebSocket ports — one per concurrent KVM session
+# websockify WebSocket ports — one per concurrent HTML5 KVM session
 EXPOSE 6080-6089
+# TCP proxy ports — one per concurrent Java iKVM session
+EXPOSE 6090-6099
 
 # Single worker + threads so kvm.py session dict is shared across requests.
 # 8 threads: bulk-status holds one thread while its ThreadPoolExecutor runs;
