@@ -55,17 +55,27 @@ def find_server(config: dict, server_id: str):
 
 # ── IPMI helpers ────────────────────────────────────────────────────────────────
 
-def check_bmc_reachable(ip: str, timeout: float = 2.0) -> bool:
-    for port in (443, 80, 623):
+def check_bmc_reachable(ip: str, timeout: float = 1.5) -> bool:
+    """Return True as soon as any BMC port (443/80/623) responds.
+
+    All three ports are tried in parallel so unreachable IPs only add one
+    timeout delay instead of three.
+    """
+    def _try(port):
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             s.settimeout(timeout)
-            if s.connect_ex((ip, port)) == 0:
-                s.close()
-                return True
+            ok = s.connect_ex((ip, port)) == 0
             s.close()
+            return ok
         except Exception:
-            pass
+            return False
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+        futs = [pool.submit(_try, p) for p in (443, 80, 623)]
+        for f in concurrent.futures.as_completed(futs):
+            if f.result():
+                return True
     return False
 
 
@@ -354,12 +364,41 @@ def api_server_status(server_id):
     online = check_bmc_reachable(server['ip'])
     power = 'unknown'
     if online:
-        ok, out, _ = run_ipmitool(server, 'power', 'status', timeout=10)
+        ok, out, _ = run_ipmitool(server, 'power', 'status', timeout=5)
         if ok:
             lower = out.lower()
             power = 'on' if 'on' in lower else 'off' if 'off' in lower else 'unknown'
 
     return jsonify({'id': server_id, 'online': online, 'power': power})
+
+
+def _check_server_status(server: dict) -> dict:
+    online = check_bmc_reachable(server['ip'])
+    power = 'unknown'
+    if online:
+        ok, out, _ = run_ipmitool(server, 'power', 'status', timeout=5)
+        if ok:
+            lower = out.lower()
+            power = 'on' if 'on' in lower else 'off' if 'off' in lower else 'unknown'
+    return {'id': server['id'], 'online': online, 'power': power}
+
+
+@app.route('/api/bulk-status', methods=['GET'])
+def api_bulk_status():
+    """Return status for all servers in one request, checked in parallel.
+
+    Avoids the N×RTT overhead of individual /status calls when there are
+    many servers (e.g. 100 entries).  Backend uses a thread pool so all
+    TCP reachability checks and ipmitool calls run concurrently.
+    """
+    config = load_config()
+    servers = [s for g in config['groups'] for s in g['servers']]
+    if not servers:
+        return jsonify({})
+    workers = min(40, len(servers))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(_check_server_status, servers))
+    return jsonify({r['id']: r for r in results})
 
 
 POWER_ACTIONS = {

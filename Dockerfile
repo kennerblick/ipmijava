@@ -71,6 +71,8 @@ EXPOSE 9193
 # websockify WebSocket ports — one per concurrent KVM session
 EXPOSE 6080-6089
 
-# Single worker + threads so kvm.py session dict is shared across requests
-CMD ["gunicorn", "-w", "1", "--threads", "4", "-b", "0.0.0.0:9193", \
+# Single worker + threads so kvm.py session dict is shared across requests.
+# 8 threads: bulk-status holds one thread while its ThreadPoolExecutor runs;
+# remaining threads handle concurrent power/probe/KVM requests without blocking.
+CMD ["gunicorn", "-w", "1", "--threads", "8", "-b", "0.0.0.0:9193", \
      "--timeout", "120", "backend.app:app"]

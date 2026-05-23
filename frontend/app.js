@@ -51,8 +51,29 @@ function scheduleStatusPoll() {
   state.pollTimer = setInterval(pollAllServers, 30_000);
 }
 
-function pollAllServers() {
-  state.groups.flatMap(g => g.servers).forEach(s => fetchStatus(s.id));
+async function pollAllServers() {
+  const servers = state.groups.flatMap(g => g.servers);
+  if (!servers.length) return;
+
+  // Mark all loading immediately so spinners appear before the request fires
+  servers.forEach(s => {
+    state.statuses[s.id] = { ...(state.statuses[s.id] || {}), loading: true };
+    updateCardInPlace(s.id);
+  });
+
+  try {
+    const result = await apiGet('/bulk-status');
+    for (const [sid, status] of Object.entries(result)) {
+      state.statuses[sid] = status;
+      updateCardInPlace(sid);
+    }
+  } catch {
+    // Fallback: mark all offline on error
+    servers.forEach(s => {
+      state.statuses[s.id] = { online: false, power: 'unknown' };
+      updateCardInPlace(s.id);
+    });
+  }
 }
 
 function refreshAll() {
